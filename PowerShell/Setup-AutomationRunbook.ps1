@@ -106,8 +106,8 @@ try {
     $variableName = "$siteName-ParameterTable"
     $variableRetrieval = "[hashtable]`$parameterTable = Get-AutomationVariable -Name '$variableName' | ConvertFrom-Json -AsHashtable"
     
-    # Replace the line that starts with [hashtable]$parameterTable = (using multiline regex mode)
-    $scriptContent = $scriptContent -replace '(?m)^\[hashtable\]\$parameterTable\s*=.*$', $variableRetrieval
+    # Replace the entire line with SITENAME-ParameterTable placeholder
+    $scriptContent = $scriptContent -replace '(?m)^\[hashtable\]\s*\$parameterTable\s*=\s*Get-AutomationVariable\s+-Name\s+.SITENAME-ParameterTable.\s*\|.*$', $variableRetrieval
     Set-Content -Path $tempPath -Value $scriptContent -Force
     Write-Host "✓ Automation variable reference injected" -ForegroundColor Green
 
@@ -307,8 +307,8 @@ Invoke-RestMethod -Uri `$uri -Method Post -Headers `$headers -Body `$body
         # Create destination context using SAS token
         $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
         
-        # Create temp file in current directory
-        $tempJsonPath = $resultsFileName
+        # Create file in current directory
+        $tempJsonPath = Join-Path (Get-Location) $resultsFileName
         $resultsJson | Out-File -FilePath $tempJsonPath -Encoding utf8 -Force
         
         # Create container if it doesn't exist
