@@ -9,9 +9,8 @@ $ResourceGroupName = $parameterTable.runBookRG
 
 [string]$ResourceGroupName = 'CI-IMAGES'
 [string]$AutomationAccountName = $siteName + "-aa"
-
 [string]$RunbookName = $siteName + "-DataMoverRunbook"
-[string]$RunbookScriptUri = "https://raw.githubusercontent.com/silk-us/scripts-and-configs/refs/heads/main/PowerShell/pstest.ps1"
+[string]$RunbookScriptUri = "https://raw.githubusercontent.com/cloudgainz/DataMoverScripts/refs/heads/main/PowerShell/Workbook.ps1"
 [string]$ScheduleName = $siteName + "-DataMoverSchedule"
 # [ValidateSet("Hour", "Day", "Week", "Month")]
 [string]$ScheduleFrequency = "Day"
