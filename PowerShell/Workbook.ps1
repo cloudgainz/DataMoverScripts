@@ -108,5 +108,5 @@ function Invoke-DataMover {
     # Write-Host "Successful: $successCount"
     # Write-Host "Failed: $errorCount"
 }
-
+Set-AzContext -Subscription $parameterTable.subscriptionName
 Invoke-DataMover -parameterTable $parameterTable

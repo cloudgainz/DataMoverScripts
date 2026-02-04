@@ -83,8 +83,50 @@ try {
         Write-Host "✓ Automation Account already exists" -ForegroundColor Green
     }
 
-    # Step 3: Download and import the runbook
-    Write-Host "`n[3/6] Importing Runbook: $RunbookName from $RunbookScriptUri" -ForegroundColor Cyan
+    # Step 3: Configure Managed Identity and Storage Permissions
+    Write-Host "`n[3/8] Configuring Managed Identity and Storage Permissions" -ForegroundColor Cyan
+    
+    # Enable system-assigned managed identity
+    Write-Host "Enabling system-assigned managed identity..." -ForegroundColor Yellow
+    $identity = Set-AzAutomationAccount `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $AutomationAccountName `
+        -AssignSystemIdentity
+    
+    $principalId = $identity.Identity.PrincipalId
+    Write-Host "✓ Managed identity enabled" -ForegroundColor Green
+    Write-Host "  Principal ID: $principalId" -ForegroundColor Gray
+    
+    # Get the export storage account
+    $exportStorageAccount = $parameterTable.exportStorageAccount
+    Write-Host "Granting Storage Blob Data Reader role to $exportStorageAccount..." -ForegroundColor Yellow
+    
+    $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount }
+    if (-not $storageAccount) {
+        Write-Host "⚠ Warning: Export storage account '$exportStorageAccount' not found in current subscription" -ForegroundColor Yellow
+        Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
+    } else {
+        # Assign Storage Blob Data Reader role
+        $roleAssignment = Get-AzRoleAssignment `
+            -ObjectId $principalId `
+            -RoleDefinitionName "Storage Blob Data Reader" `
+            -Scope $storageAccount.Id `
+            -ErrorAction SilentlyContinue
+        
+        if (-not $roleAssignment) {
+            New-AzRoleAssignment `
+                -ObjectId $principalId `
+                -RoleDefinitionName "Storage Blob Data Reader" `
+                -Scope $storageAccount.Id | Out-Null
+            
+            Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
+        } else {
+            Write-Host "✓ Storage Blob Data Reader role already assigned" -ForegroundColor Green
+        }
+    }
+
+    # Step 4: Download and import the runbook
+    Write-Host "`n[4/8] Importing Runbook: $RunbookName from $RunbookScriptUri" -ForegroundColor Cyan
     
     # Download the script to a temporary location
     Write-Host "Downloading script from URI..." -ForegroundColor Yellow
@@ -135,8 +177,8 @@ try {
     # Clean up temp file
     Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
 
-    # Step 4: Create Automation Variable for parameterTable
-    Write-Host "`n[4/7] Creating Automation Variable for parameterTable" -ForegroundColor Cyan
+    # Step 5: Create Automation Variable for parameterTable
+    Write-Host "`n[5/8] Creating Automation Variable for parameterTable" -ForegroundColor Cyan
     
     $variableName = "$siteName-ParameterTable"
     
@@ -168,8 +210,8 @@ try {
     Write-Host "✓ Automation Variable created successfully" -ForegroundColor Green
     Write-Host "  Variable Name: $variableName" -ForegroundColor Gray
 
-    # Step 5: Create Schedule
-    Write-Host "`n[5/7] Creating Schedule: $ScheduleName" -ForegroundColor Cyan
+    # Step 6: Create Schedule
+    Write-Host "`n[6/8] Creating Schedule: $ScheduleName" -ForegroundColor Cyan
     
     # Check if schedule exists
     $existingSchedule = Get-AzAutomationSchedule `
@@ -200,8 +242,8 @@ try {
     Write-Host "  Start Time: $ScheduleStartTime" -ForegroundColor Gray
     Write-Host "  Time Zone: $((Get-TimeZone).Id)" -ForegroundColor Gray
 
-    # Step 6: Link Schedule to Runbook
-    Write-Host "`n[6/7] Linking Schedule to Runbook" -ForegroundColor Cyan
+    # Step 7: Link Schedule to Runbook
+    Write-Host "`n[7/8] Linking Schedule to Runbook" -ForegroundColor Cyan
     
     Register-AzAutomationScheduledRunbook `
         -ResourceGroupName $ResourceGroupName `
@@ -212,8 +254,8 @@ try {
     Write-Host "✓ Schedule linked to runbook successfully" -ForegroundColor Green
     Write-Host "  Note: Runbook will retrieve parameterTable from automation variable: $variableName" -ForegroundColor Gray
 
-    # Step 7: Create Webhook with authentication
-    Write-Host "`n[7/7] Creating Webhook: $WebhookName" -ForegroundColor Cyan
+    # Step 8: Create Webhook with authentication
+    Write-Host "`n[8/8] Creating Webhook: $WebhookName" -ForegroundColor Cyan
     
     # Check if webhook exists and remove it
     $existingWebhook = Get-AzAutomationWebhook `
