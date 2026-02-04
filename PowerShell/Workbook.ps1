@@ -1,4 +1,4 @@
-$parameterTable = Get-AutomationVariable -Name 'SITENAME-ParameterTable'
+[hashtable]$parameterTable = Get-AutomationVariable -Name 'SITENAME-ParameterTable' | ConvertFrom-Json -AsHashtable
 
 function Invoke-DataMover {
     param(
