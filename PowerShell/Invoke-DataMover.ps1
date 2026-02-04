@@ -56,7 +56,7 @@ $containerName = $siteName.ToLower()
 $destinationContainer = Get-AzStorageContainer -Name $containerName -Context $destinationContext -ErrorAction SilentlyContinue
 if (-not $destinationContainer) {
     Write-Host "Creating destination container: $containerName"
-    New-AzStorageContainer -Name $containerName -Context $destinationContext -Permission Off | Out-Null
+    New-AzStorageContainer -Name $containerName -Context $destinationContext -Permission Off -force | Out-Null
 }
 
 # Copy blobs preserving full directory structure
@@ -105,9 +105,3 @@ Write-Host "Total blobs: $($sourceBlobs.Count)"
 Write-Host "Successful: $successCount"
 Write-Host "Failed: $errorCount"
 
-if ($errorCount -gt 0) {
-    exit 1
-}
-else {
-    exit 0
-}
