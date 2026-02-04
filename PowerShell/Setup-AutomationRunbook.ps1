@@ -118,7 +118,7 @@ try {
         -AutomationAccountName $AutomationAccountName `
         -Name $RunbookName `
         -Path $tempPath `
-        -Type PowerShell7 `
+        -Type PowerShell72 `
         -Force
 
     Write-Host "✓ Runbook imported successfully" -ForegroundColor Green
