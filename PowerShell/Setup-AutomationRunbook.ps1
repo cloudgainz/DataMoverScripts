@@ -6,6 +6,9 @@ param(
 $location = $parameterTable.location
 $siteName = $parameterTable.siteName
 $ResourceGroupName = $parameterTable.runBookRG
+$subscriptionName = $parameterTable.subscriptionName 
+
+Set-AzContext -Subscription $subscriptionName
 
 [string]$ResourceGroupName = 'CI-IMAGES'
 [string]$AutomationAccountName = $siteName + "-aa"
@@ -115,7 +118,7 @@ try {
         -AutomationAccountName $AutomationAccountName `
         -Name $RunbookName `
         -Path $tempPath `
-        -Type PowerShell `
+        -Type PowerShell7 `
         -Force
 
     Write-Host "✓ Runbook imported successfully" -ForegroundColor Green
