@@ -63,13 +63,9 @@ function Invoke-DataMover {
         if ([string]::IsNullOrWhiteSpace($siteName)) { throw "siteName is required" }
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ All parameters validated"
 
-        # Get source storage account and context
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to source storage account..."
-        $sourceStorageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount }
-        if (-not $sourceStorageAccount) {
-            throw "Export storage account '$exportStorageAccount' not found in current subscription"
-        }
-        $sourceContext = $sourceStorageAccount.Context
+        # Create source storage context using managed identity
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to source storage account using managed identity..."
+        $sourceContext = New-AzStorageContext -StorageAccountName $exportStorageAccount -UseConnectedAccount
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to source storage account"
 
         # Create destination context using SAS token
