@@ -14,7 +14,7 @@ catch {
 # Retrieve parameter table from automation variable
 try {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving parameter table from automation variable..."
-    [hashtable]$parameterTable = Get-AutomationVariable -Name 'SITENAME-ParameterTable' | ConvertFrom-Json -AsHashtable
+    [hashtable]$parameterTable = Get-AutomationVariable -Name XXSITETABLEXX | ConvertFrom-Json -AsHashtable
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Parameter table retrieved successfully"
 }
 catch {

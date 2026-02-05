@@ -145,11 +145,13 @@ try {
     # Modify the script to inject the automation variable retrieval
     Write-Host "Injecting automation variable reference..." -ForegroundColor Yellow
     $scriptContent = Get-Content -Path $tempPath -Raw
-    $variableName = "$siteName-ParameterTable"
-    $variableRetrieval = "[hashtable]`$parameterTable = Get-AutomationVariable -Name '$variableName' | ConvertFrom-Json -AsHashtable"
+    # $variableName = "$siteName-ParameterTable"
+    # $variableRetrieval = "[hashtable]`$parameterTable = Get-AutomationVariable -Name '$variableName' | ConvertFrom-Json -AsHashtable"
     
     # Replace the entire line with SITENAME-ParameterTable placeholder
-    $scriptContent = $scriptContent -replace '(?m)^\[hashtable\]\s*\$parameterTable\s*=\s*Get-AutomationVariable\s+-Name\s+.SITENAME-ParameterTable.\s*\|.*$', $variableRetrieval
+    # $scriptContent = $scriptContent -replace '(?m)^\[hashtable\]\s*\$parameterTable\s*=\s*Get-AutomationVariable\s+-Name\s+.SITENAME-ParameterTable.\s*\|.*$', $variableRetrieval
+    $siteNameTable = "$siteName-ParameterTable"
+    $scriptContent = $scriptContent.replace("XXSITETABLEXX",$siteNameTable)
     Set-Content -Path $tempPath -Value $scriptContent -Force
     Write-Host "✓ Automation variable reference injected" -ForegroundColor Green
 
