@@ -1,3 +1,16 @@
+# Authenticate using the automation account's managed identity
+try
+{
+    Write-Verbose "Logging in to Azure..." -Verbose
+    Connect-AzAccount -Identity
+}
+catch {
+    Write-Error -Message $_.Exception
+    throw $_.Exception
+}
+
+
+# Retrieve parameter table from automation variable
 [hashtable]$parameterTable = Get-AutomationVariable -Name 'SITENAME-ParameterTable' | ConvertFrom-Json -AsHashtable
 
 function Invoke-DataMover {
