@@ -1,3 +1,7 @@
+param(
+    [int] $days = 1
+)
+
 # Authenticate using the automation account's managed identity
 try {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting runbook execution"
@@ -26,7 +30,9 @@ catch {
 function Invoke-DataMover {
     param(
         [parameter(Mandatory)]
-        [hashtable]$parameterTable
+        [hashtable] $parameterTable,
+        [parameter()]
+        [int] $days 
     )
 
     $jobStartTime = Get-Date
@@ -65,6 +71,7 @@ function Invoke-DataMover {
 
         # Create source storage context using managed identity
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to source storage account using managed identity..."
+        # $sourceContext = (Get-AzStorageAccount -Name oficustgnzprod01 -ResourceGroupName gnz-cust-prod-rg-customerstorage-01).Context
         $sourceContext = New-AzStorageContext -StorageAccountName $exportStorageAccount -UseConnectedAccount
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to source storage account"
 
@@ -79,7 +86,9 @@ function Invoke-DataMover {
         # Get all blobs from source
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Listing blobs in source..."
         $allBlobs = Get-AzStorageBlob -Container $exportStorageContainer -Context $sourceContext -Prefix $normalizedPath
-
+        $pruneDate = (Get-Date).addDays(-$days)
+        $allBlobs = $allBlobs | Where-Object {$_.LastModified -gt $pruneDate}
+        
         # Filter out directory marker blobs (those ending with / or with 0 length that represent folders)
         $sourceBlobs = $allBlobs | Where-Object { 
             -not $_.Name.EndsWith('/') -and $_.Length -gt 0 
@@ -215,7 +224,7 @@ try {
     Set-AzContext -Subscription $parameterTable.subscriptionName | Out-Null
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Subscription context set"
     
-    $result = Invoke-DataMover -parameterTable $parameterTable
+    $result = Invoke-DataMover -parameterTable $parameterTable -days $days
     
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runbook execution completed successfully"
     Write-Output ($result | ConvertTo-Json -Depth 10)
