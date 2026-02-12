@@ -70,12 +70,16 @@ try {
     $automationAccount = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
     
     if (-not $automationAccount) {
-        $automationAccount = New-AzAutomationAccount `
-            -ResourceGroupName $ResourceGroupName `
-            -Name $AutomationAccountName `
-            -Location $Location `
-            -Plan Basic `
-            -Tags $Tags
+        $automationAccount = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -Plan Basic -Tags $Tags # -- Trap this in case of failure and provide a helpful error message -- wait for account
+
+        Start-Sleep -Seconds 10 # Wait for the account to be fully provisioned before proceeding
+
+        $aatest = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
+        while ($aatest -eq $null) {
+            Write-Host "Waiting for Automation Account to be provisioned..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 5
+            $aatest = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
+        }
         
         Write-Host "✓ Automation Account created successfully" -ForegroundColor Green
         Write-Host "  Account ID: $($automationAccount.AutomationAccountId)" -ForegroundColor Gray
@@ -88,10 +92,7 @@ try {
     
     # Enable system-assigned managed identity
     Write-Host "Enabling system-assigned managed identity..." -ForegroundColor Yellow
-    $identity = Set-AzAutomationAccount `
-        -ResourceGroupName $ResourceGroupName `
-        -Name $AutomationAccountName `
-        -AssignSystemIdentity
+    $identity = Set-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -AssignSystemIdentity
     
     $principalId = $identity.Identity.PrincipalId
     Write-Host "✓ Managed identity enabled" -ForegroundColor Green
@@ -107,17 +108,10 @@ try {
         Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
     } else {
         # Assign Storage Blob Data Reader role
-        $roleAssignment = Get-AzRoleAssignment `
-            -ObjectId $principalId `
-            -RoleDefinitionName "Storage Blob Data Reader" `
-            -Scope $storageAccount.Id `
-            -ErrorAction SilentlyContinue
+        $roleAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
         
         if (-not $roleAssignment) {
-            New-AzRoleAssignment `
-                -ObjectId $principalId `
-                -RoleDefinitionName "Storage Blob Data Reader" `
-                -Scope $storageAccount.Id | Out-Null
+            New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id | Out-Null
             
             Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
         } else {
@@ -133,7 +127,6 @@ try {
 
     $tempPath = $RunbookScriptUri.Split('/')[-1]
 
-    
     try {
         Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
         Invoke-RestMethod -Uri $RunbookScriptUri -OutFile $tempPath -UseBasicParsing 
@@ -157,22 +150,13 @@ try {
 
     # Import the runbook
     Write-Host "Importing runbook into Automation Account..." -ForegroundColor Yellow
-    Import-AzAutomationRunbook `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $RunbookName `
-        -Path $tempPath `
-        -Type PowerShell72 `
-        -Force
+    Import-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $RunbookName -Path $tempPath -Type PowerShell72 -Force
 
     Write-Host "✓ Runbook imported successfully" -ForegroundColor Green
 
     # Publish the runbook
     Write-Host "Publishing runbook..." -ForegroundColor Yellow
-    Publish-AzAutomationRunbook `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $RunbookName
+    Publish-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $RunbookName
     
     Write-Host "✓ Runbook published successfully" -ForegroundColor Green
 
@@ -185,29 +169,17 @@ try {
     $variableName = "$siteName-ParameterTable"
     
     # Check if variable exists and remove it
-    $existingVariable = Get-AzAutomationVariable `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $variableName `
-        -ErrorAction SilentlyContinue
+    $existingVariable = Get-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $variableName -ErrorAction SilentlyContinue
 
     if ($existingVariable) {
         Write-Host "Variable already exists. Removing old variable..." -ForegroundColor Yellow
-        Remove-AzAutomationVariable `
-            -ResourceGroupName $ResourceGroupName `
-            -AutomationAccountName $AutomationAccountName `
-            -Name $variableName
+        Remove-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $variableName
     }
 
     # Convert hashtable to JSON for storage
     $parameterTableJson = $parameterTable | ConvertTo-Json -Depth 10 -Compress
     
-    New-AzAutomationVariable `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $variableName `
-        -Value $parameterTableJson `
-        -Encrypted $false
+    New-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $variableName -Value $parameterTableJson -Encrypted $false
 
     Write-Host "✓ Automation Variable created successfully" -ForegroundColor Green
     Write-Host "  Variable Name: $variableName" -ForegroundColor Gray
@@ -216,28 +188,14 @@ try {
     Write-Host "`n[6/8] Creating Schedule: $ScheduleName" -ForegroundColor Cyan
     
     # Check if schedule exists
-    $existingSchedule = Get-AzAutomationSchedule `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $ScheduleName `
-        -ErrorAction SilentlyContinue
+    $existingSchedule = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -ErrorAction SilentlyContinue
 
     if ($existingSchedule) {
         Write-Host "Schedule already exists. Removing old schedule..." -ForegroundColor Yellow
-        Remove-AzAutomationSchedule `
-            -ResourceGroupName $ResourceGroupName `
-            -AutomationAccountName $AutomationAccountName `
-            -Name $ScheduleName `
-            -Force
+        Remove-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -Force
     }
 
-   New-AzAutomationSchedule `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $ScheduleName `
-        -StartTime $ScheduleStartTime `
-        -TimeZone (Get-TimeZone).Id `
-        -DayInterval $ScheduleInterval
+   New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -StartTime $ScheduleStartTime -TimeZone (Get-TimeZone).Id -DayInterval $ScheduleInterval
 
     Write-Host "✓ Schedule created successfully" -ForegroundColor Green
     Write-Host "  Frequency: Every $ScheduleInterval $ScheduleFrequency(s)" -ForegroundColor Gray
@@ -247,11 +205,7 @@ try {
     # Step 7: Link Schedule to Runbook
     Write-Host "`n[7/8] Linking Schedule to Runbook" -ForegroundColor Cyan
     
-    Register-AzAutomationScheduledRunbook `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -RunbookName $RunbookName `
-        -ScheduleName $ScheduleName
+    Register-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -RunbookName $RunbookName -ScheduleName $ScheduleName
     
     Write-Host "✓ Schedule linked to runbook successfully" -ForegroundColor Green
     Write-Host "  Note: Runbook will retrieve parameterTable from automation variable: $variableName" -ForegroundColor Gray
@@ -260,32 +214,17 @@ try {
     Write-Host "`n[8/8] Creating Webhook: $WebhookName" -ForegroundColor Cyan
     
     # Check if webhook exists and remove it
-    $existingWebhook = Get-AzAutomationWebhook `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -Name $WebhookName `
-        -ErrorAction SilentlyContinue
+    $existingWebhook = Get-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName -ErrorAction SilentlyContinue
 
     if ($existingWebhook) {
         Write-Host "Webhook already exists. Removing old webhook..." -ForegroundColor Yellow
-        Remove-AzAutomationWebhook `
-            -ResourceGroupName $ResourceGroupName `
-            -AutomationAccountName $AutomationAccountName `
-            -Name $WebhookName `
-            -Force
+        Remove-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName -Force
     }
 
     # Create webhook with expiry
     $webhookExpiryDate = (Get-Date).AddYears($WebhookExpiryYears)
     
-    $webhook = New-AzAutomationWebhook `
-        -ResourceGroupName $ResourceGroupName `
-        -AutomationAccountName $AutomationAccountName `
-        -RunbookName $RunbookName `
-        -Name $WebhookName `
-        -IsEnabled $true `
-        -ExpiryTime $webhookExpiryDate `
-        -Force
+    $webhook = New-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -RunbookName $RunbookName -Name $WebhookName -IsEnabled $true -ExpiryTime $webhookExpiryDate -Force
 
     Write-Host "✓ Webhook created successfully" -ForegroundColor Green
     Write-Host "  Expires: $webhookExpiryDate" -ForegroundColor Gray
@@ -363,12 +302,7 @@ Invoke-RestMethod -Uri `$uri -Method Post -Headers `$headers -Body `$body
         }
         
         # Upload to customer storage account
-        Set-AzStorageBlobContent `
-            -File $tempJsonPath `
-            -Container $containerName `
-            -Blob $resultsFileName `
-            -Context $destinationContext `
-            -Force | Out-Null
+        Set-AzStorageBlobContent -File $tempJsonPath -Container $containerName -Blob $resultsFileName -Context $destinationContext -Force | Out-Null
         
         Write-Host "✓ Results uploaded: $resultsFileName to $customerStorageAccount/$containerName" -ForegroundColor Green
         
