@@ -1,6 +1,27 @@
 param(
+    [object] $WebhookData,
     [int] $days = 1
 )
+
+# If called via webhook, extract parameters from WebhookData
+if ($WebhookData) {
+    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called via webhook"
+    if ($WebhookData.RequestBody) {
+        try {
+            $webhookParams = $WebhookData.RequestBody | ConvertFrom-Json
+            if ($webhookParams.days) {
+                $days = [int]$webhookParams.days
+                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Using webhook parameter: days=$days"
+            }
+        }
+        catch {
+            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to parse webhook parameters: $($_.Exception.Message)"
+        }
+    }
+}
+else {
+    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
+}
 
 # Authenticate using the automation account's managed identity
 try {
@@ -56,6 +77,7 @@ function Invoke-DataMover {
         Write-Output "  Site: $siteName"
         Write-Output "  Source: $exportStorageAccount/$exportStorageContainer/$exportsDirectory"
         Write-Output "  Destination: $customerStorageAccount/$($siteName.ToLower())"
+        Write-Output "  Days: $days"
 
         # Validate required parameters
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Validating parameters..."
