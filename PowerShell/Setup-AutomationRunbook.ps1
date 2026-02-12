@@ -233,7 +233,7 @@ try {
 
     if ($existingWebhook) {
         Write-Host "Webhook already exists. Removing old webhook..." -ForegroundColor Yellow
-        Remove-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName -Force
+        Remove-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName 
     }
 
     # Create webhook with expiry
