@@ -73,9 +73,11 @@ function Invoke-DataMover {
         $location = $parameterTable.location
         $siteName = $parameterTable.siteName
 
+        $normalizedPath = $exportsDirectory.Trim('/')
+
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Configuration:"
         Write-Output "  Site: $siteName"
-        Write-Output "  Source: $exportStorageAccount/$exportStorageContainer/$exportsDirectory"
+        Write-Output "  Source: $exportStorageAccount/$exportStorageContainer/$normalizedPath"
         Write-Output "  Destination: $customerStorageAccount/$($siteName.ToLower())"
         Write-Output "  Days: $days"
 
@@ -102,14 +104,19 @@ function Invoke-DataMover {
         $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to destination storage account"
 
-        # Normalize the directory path
-        $normalizedPath = $exportsDirectory.Trim('/')
-
         # Get all blobs from source
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Listing blobs in source..."
         $allBlobs = Get-AzStorageBlob -Container $exportStorageContainer -Context $sourceContext -Prefix $normalizedPath
+
+        # Report unfiltered blob count (before pruning/filtering)
+        $unfilteredCount = if ($allBlobs) { ($allBlobs | Measure-Object).Count } else { 0 }
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Unfiltered blobs found: $unfilteredCount in $exportStorageContainer/$normalizedPath"
+
         $pruneDate = (Get-Date).addDays(-$days)
         $allBlobs = $allBlobs | Where-Object {$_.LastModified -gt $pruneDate}
+
+        $filteredCount = if ($allBlobs) { ($allBlobs | Measure-Object).Count } else { 0 }
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Filtered blobs found: $filteredCount in $exportStorageContainer/$normalizedPath"
         
         # Filter out directory marker blobs (those ending with / or with 0 length that represent folders)
         $sourceBlobs = $allBlobs | Where-Object { 
