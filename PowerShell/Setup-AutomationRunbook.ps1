@@ -10,7 +10,7 @@ $subscriptionName = $parameterTable.subscriptionName
 
 Set-AzContext -Subscription $subscriptionName
 
-[string]$ResourceGroupName = 'CI-IMAGES'
+[string]$ResourceGroupName =  $parameterTable.runBookRG
 [string]$AutomationAccountName = $siteName + "-aa"
 [string]$RunbookName = $siteName + "-DataMoverRunbook"
 [string]$RunbookScriptUri = "https://raw.githubusercontent.com/cloudgainz/DataMoverScripts/refs/heads/main/PowerShell/Workbook.ps1"
