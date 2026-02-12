@@ -82,7 +82,7 @@ try {
         }
         
         Write-Host "✓ Automation Account created successfully" -ForegroundColor Green
-        Write-Host "  Account ID: $($automationAccount.AutomationAccountId)" -ForegroundColor Gray
+        Write-Host "  Account ID: $($automationAccount.Identity.PrincipalId)" -ForegroundColor Gray
     } else {
         Write-Host "✓ Automation Account already exists" -ForegroundColor Green
     }
@@ -111,7 +111,22 @@ try {
         $roleAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
         
         if (-not $roleAssignment) {
-            New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id | Out-Null
+            $tryTotal = 5
+            $tryCount = 0 
+            while ($tryCount -lt $tryTotal) {
+                try {
+                    New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id | Out-Null
+                    Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
+                    break
+                } catch {
+                    $tryCount++
+                    if ($tryCount -ge $tryTotal) {
+                        throw "Failed to assign Storage Blob Data Reader role after $tryTotal attempts: $_"
+                    }
+                    Write-Host "Failed to assign role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
+                    Start-Sleep -Seconds 5
+                }
+            }
             
             Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
         } else {

@@ -23,6 +23,8 @@ else {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
 }
 
+# Update check
+
 # Authenticate using the automation account's managed identity
 try {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting runbook execution"
