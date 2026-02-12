@@ -23,7 +23,8 @@ else {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
 }
 
-# Update check
+# (get-date).ToString('o')
+# V 2026-02-12T15:52:58.9159102-07:00
 
 # Authenticate using the automation account's managed identity
 try {
