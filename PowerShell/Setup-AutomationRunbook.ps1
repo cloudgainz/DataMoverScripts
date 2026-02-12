@@ -102,7 +102,17 @@ try {
     $exportStorageAccount = $parameterTable.exportStorageAccount
     Write-Host "Granting required roles to $exportStorageAccount..." -ForegroundColor Yellow
 
-    $storageAccount = Get-AzStorageAccount -Name $exportStorageAccount -ErrorAction SilentlyContinue
+    # Try to retrieve storage account by name. Some Az module versions / parameter sets
+    # can raise a parameter-set error in Automation runbooks; fall back to enumerating accounts.
+    $storageAccount = $null
+    try {
+        $storageAccount = Get-AzStorageAccount -Name $exportStorageAccount -ErrorAction Stop
+    }
+    catch {
+        Write-Host "Get-AzStorageAccount -Name failed: $($_.Exception.Message). Falling back to enumerate all storage accounts..." -ForegroundColor Yellow
+        $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount } | Select-Object -First 1
+    }
+
     if (-not $storageAccount) {
         Write-Host "⚠ Warning: Export storage account '$exportStorageAccount' not found in current subscription" -ForegroundColor Yellow
         Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
