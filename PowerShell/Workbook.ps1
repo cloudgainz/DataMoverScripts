@@ -98,9 +98,9 @@ function Invoke-DataMover {
 
         # Create source storage context using managed identity via management-plane storage account retrieval
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving storage account object for $exportStorageAccount"
-        $storageAccountObj = Get-AzStorageAccount -Name $exportStorageAccount -ErrorAction SilentlyContinue
+        $storageAccountObj = Get-AzStorageAccount -ErrorAction SilentlyContinue | Where-Object { $_.StorageAccountName -eq $exportStorageAccount } | Select-Object -First 1
         if (-not $storageAccountObj) {
-            throw "Storage account '$exportStorageAccount' not found in the current subscription. Ensure the Automation Account has Reader permission on the storage account or provide the resource group name."
+            throw "Storage account '$exportStorageAccount' not found in the current subscription. Ensure the Automation Account has Reader permission on the storage account."
         }
         $sourceContext = $storageAccountObj.Context
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Using storage account context from management plane: $($storageAccountObj.Id)"
