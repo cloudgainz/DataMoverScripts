@@ -24,7 +24,7 @@ else {
 }
 
 # (get-date).ToString('o')
-# 2026-02-12T16:49:25.9277832-07:00
+# 2026-02-12T17:04:29.5637548-07:00
 
 # Authenticate using the automation account's managed identity
 try {
