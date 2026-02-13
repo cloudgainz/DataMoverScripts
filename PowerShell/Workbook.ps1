@@ -23,8 +23,8 @@ else {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
 }
 
-# (get-date).ToString('o')
-# V 2026-02-12T15:52:58.9159102-07:00
+# (get-date).ToString('o') | clip
+# V 2026-02-12T17:56:13.2549460-07:00
 
 # Authenticate using the automation account's managed identity
 try {
@@ -97,10 +97,18 @@ function Invoke-DataMover {
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ All parameters validated"
 
         # Create source storage context using managed identity
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to source storage account using managed identity..."
-        # $sourceContext = (Get-AzStorageAccount -Name oficustgnzprod01 -ResourceGroupName gnz-cust-prod-rg-customerstorage-01).Context
-        $sourceContext = New-AzStorageContext -StorageAccountName $exportStorageAccount -UseConnectedAccount
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to source storage account"
+        # Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to source storage account using managed identity..."
+        # $sourceContext = New-AzStorageContext -StorageAccountName $exportStorageAccount -UseConnectedAccount
+        # Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to source storage account"
+
+        # Create source storage context using managed identity via Get-AzStorageAccount
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving storage account object for $exportStorageAccount..."
+        $storageAccountObj = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount } | Select-Object -First 1
+        if (-not $storageAccountObj) {
+            throw "Storage account '$exportStorageAccount' not found. Ensure the Automation Account has Reader permission on the storage account."
+        }
+        $sourceContext = $storageAccountObj.Context
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Using storage account context: $($storageAccountObj.Id)"
 
         # Create destination context using SAS token
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to destination storage account..."

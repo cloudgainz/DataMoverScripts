@@ -99,18 +99,77 @@ try {
     Write-Host "  Principal ID: $principalId" -ForegroundColor Gray
     
     # Get the export storage account
+    # $exportStorageAccount = $parameterTable.exportStorageAccount
+    # Write-Host "Granting Storage Blob Data Reader role to $exportStorageAccount..." -ForegroundColor Yellow
+    
+    # $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount }
+    # if (-not $storageAccount) {
+    #     Write-Host "⚠ Warning: Export storage account '$exportStorageAccount' not found in current subscription" -ForegroundColor Yellow
+    #     Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
+    # } else {
+    #     # Assign Storage Blob Data Reader role
+    #     $roleAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
+        
+    #     if (-not $roleAssignment) {
+    #         $tryTotal = 5
+    #         $tryCount = 0 
+    #         while ($tryCount -lt $tryTotal) {
+    #             try {
+    #                 New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id | Out-Null
+    #                 Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
+    #                 break
+    #             } catch {
+    #                 $tryCount++
+    #                 if ($tryCount -ge $tryTotal) {
+    #                     throw "Failed to assign Storage Blob Data Reader role after $tryTotal attempts: $_"
+    #                 }
+    #                 Write-Host "Failed to assign role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
+    #                 Start-Sleep -Seconds 5
+    #             }
+    #         }
+            
+    #         Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
+    #     } else {
+    #         Write-Host "✓ Storage Blob Data Reader role already assigned" -ForegroundColor Green
+    #     }
+    # }
+
+        # Get the export storage account
     $exportStorageAccount = $parameterTable.exportStorageAccount
-    Write-Host "Granting Storage Blob Data Reader role to $exportStorageAccount..." -ForegroundColor Yellow
+    Write-Host "Granting required roles to $exportStorageAccount..." -ForegroundColor Yellow
     
     $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount }
     if (-not $storageAccount) {
         Write-Host "⚠ Warning: Export storage account '$exportStorageAccount' not found in current subscription" -ForegroundColor Yellow
         Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
     } else {
+        # Assign Reader role
+        $readerAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
+        if (-not $readerAssignment) {
+            $tryTotal = 5
+            $tryCount = 0 
+            while ($tryCount -lt $tryTotal) {
+                try {
+                    New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Reader" -Scope $storageAccount.Id | Out-Null
+                    Write-Host "✓ Reader role assigned" -ForegroundColor Green
+                    break
+                } catch {
+                    $tryCount++
+                    if ($tryCount -ge $tryTotal) {
+                        throw "Failed to assign Reader role after $tryTotal attempts: $_"
+                    }
+                    Write-Host "Failed to assign Reader role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
+                    Start-Sleep -Seconds 5
+                }
+            }
+        } else {
+            Write-Host "✓ Reader role already assigned" -ForegroundColor Green
+        }
+
         # Assign Storage Blob Data Reader role
-        $roleAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
+        $blobReaderAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
         
-        if (-not $roleAssignment) {
+        if (-not $blobReaderAssignment) {
             $tryTotal = 5
             $tryCount = 0 
             while ($tryCount -lt $tryTotal) {
@@ -123,16 +182,39 @@ try {
                     if ($tryCount -ge $tryTotal) {
                         throw "Failed to assign Storage Blob Data Reader role after $tryTotal attempts: $_"
                     }
-                    Write-Host "Failed to assign role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
+                    Write-Host "Failed to assign Storage Blob Data Reader role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
                     Start-Sleep -Seconds 5
                 }
             }
-            
-            Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
         } else {
             Write-Host "✓ Storage Blob Data Reader role already assigned" -ForegroundColor Green
         }
+
+        # Assign Storage Account Contributor role
+        $contributorAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Account Contributor" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
+        
+        if (-not $contributorAssignment) {
+            $tryTotal = 5
+            $tryCount = 0 
+            while ($tryCount -lt $tryTotal) {
+                try {
+                    New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Account Contributor" -Scope $storageAccount.Id | Out-Null
+                    Write-Host "✓ Storage Account Contributor role assigned" -ForegroundColor Green
+                    break
+                } catch {
+                    $tryCount++
+                    if ($tryCount -ge $tryTotal) {
+                        throw "Failed to assign Storage Account Contributor role after $tryTotal attempts: $_"
+                    }
+                    Write-Host "Failed to assign Storage Account Contributor role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
+                    Start-Sleep -Seconds 5
+                }
+            }
+        } else {
+            Write-Host "✓ Storage Account Contributor role already assigned" -ForegroundColor Green
+        }
     }
+
 
     # Step 4: Download and import the runbook
     Write-Host "`n[4/8] Importing Runbook: $RunbookName from $RunbookScriptUri" -ForegroundColor Cyan
