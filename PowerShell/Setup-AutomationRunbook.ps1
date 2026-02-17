@@ -240,6 +240,7 @@ try {
     
     # Replace the entire line with SITENAME-ParameterTable placeholder
     # $scriptContent = $scriptContent -replace '(?m)^\[hashtable\]\s*\$parameterTable\s*=\s*Get-AutomationVariable\s+-Name\s+.SITENAME-ParameterTable.\s*\|.*$', $variableRetrieval
+    Start-Sleep -Seconds 5
     $siteNameTable = "$siteName-ParameterTable"
     $scriptContent = $scriptContent.replace("XXSITETABLEXX",$siteNameTable)
     Set-Content -Path $tempPath -Value $scriptContent -Force
