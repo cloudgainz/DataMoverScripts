@@ -23,7 +23,7 @@ else {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
 }
 
-Start transcript to capture all output
+#Start transcript to capture all output
 $transcriptFileName = "transcript_job_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $transcriptPath = Join-Path $env:TEMP $transcriptFileName
 Start-Transcript -Path $transcriptPath -Force
