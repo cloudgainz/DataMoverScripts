@@ -270,7 +270,6 @@ function Invoke-DataMover {
 
     try {
         Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Uploading transcript to logs container..."
-        $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
 
         # Create logs container if it doesn't exist
         $logsContainer = Get-AzStorageContainer -Name 'logs' -Context $destinationContext -ErrorAction SilentlyContinue
