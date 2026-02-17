@@ -23,10 +23,18 @@ else {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
 }
 
-#Start transcript to capture all output
-$transcriptFileName = "transcript_job_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-$transcriptPath = Join-Path $env:TEMP $transcriptFileName
-Start-Transcript -Path $transcriptPath -Force
+# Get the current job context for later retrieval of job output
+$jobId = $null
+$automationAccountName = $null
+$resourceGroupName = $null
+
+try {
+    # Try to get job ID from the automation context
+    $jobId = $PSPrivateMetadata.JobId.Guid
+    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Job ID: $jobId"
+} catch {
+    Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Could not retrieve job ID: $($_.Exception.Message)"
+}
 
 # (get-date).ToString('o') | clip
 # V 2026-02-12T17:56:13.2549460-07:00
@@ -312,32 +320,87 @@ catch {
     throw
 }
 finally {
-    # Stop transcript and upload to logs container
-    try {
-        Stop-Transcript
-    } catch {
-        Write-Warning "Failed to stop transcript: $($_.Exception.Message)"
-    }
+    # Retrieve and upload Azure Automation job output to logs container
+    if ($jobId -and $parameterTable) {
+        try {
+            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving job output from Azure Automation..."
+            
+            # Give the job a moment to finalize output
+            Start-Sleep -Seconds 5
+            
+            # Get automation account details from the current context
+            $automationAccounts = Get-AzAutomationAccount
+            $currentAccount = $automationAccounts | Where-Object {
+                $jobs = Get-AzAutomationJob -ResourceGroupName $_.ResourceGroupName -AutomationAccountName $_.AutomationAccountName -Id $jobId -ErrorAction SilentlyContinue
+                $null -ne $jobs
+            } | Select-Object -First 1
+            
+            if ($currentAccount) {
+                $automationAccountName = $currentAccount.AutomationAccountName
+                $resourceGroupName = $currentAccount.ResourceGroupName
+                
+                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Found automation account: $automationAccountName in resource group: $resourceGroupName"
+                
+                # Retrieve all job output streams
+                $jobOutput = Get-AzAutomationJobOutput -ResourceGroupName $resourceGroupName `
+                    -AutomationAccountName $automationAccountName `
+                    -Id $jobId `
+                    -Stream Any
+                
+                # Build the complete output log
+                $outputLog = @()
+                $outputLog += "======================================"
+                $outputLog += "Azure Automation Job Output Log"
+                $outputLog += "Job ID: $jobId"
+                $outputLog += "Automation Account: $automationAccountName"
+                $outputLog += "Resource Group: $resourceGroupName"
+                $outputLog += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                $outputLog += "======================================"
+                $outputLog += ""
+                
+                foreach ($output in $jobOutput) {
+                    $outputDetail = Get-AzAutomationJobOutputRecord -ResourceGroupName $resourceGroupName `
+                        -AutomationAccountName $automationAccountName `
+                        -JobId $jobId `
+                        -Id $output.StreamRecordId
+                    
+                    $timestamp = $output.Time.ToString('yyyy-MM-dd HH:mm:ss')
+                    $stream = $output.Type
+                    $message = $outputDetail.Value.Values -join ' '
+                    
+                    $outputLog += "[$timestamp] [$stream] $message"
+                }
+                
+                # Save to temp file
+                $logFileName = "job_output_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+                $logPath = Join-Path $env:TEMP $logFileName
+                $outputLog | Out-File -FilePath $logPath -Encoding UTF8
+                
+                # Upload to storage
+                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Uploading job output to logs container..."
+                $customerStorageAccount = $parameterTable.customerStorageAccount
+                $customerToken = $parameterTable.customerToken
+                $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
 
-    try {
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Uploading transcript to logs container..."
-        $customerStorageAccount = $parameterTable.customerStorageAccount
-        $customerToken = $parameterTable.customerToken
-        $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
+                # Create logs container if it doesn't exist
+                $logsContainer = Get-AzStorageContainer -Name 'logs' -Context $destinationContext -ErrorAction SilentlyContinue
+                if (-not $logsContainer) {
+                    New-AzStorageContainer -Name 'logs' -Context $destinationContext -Permission Off | Out-Null
+                }
 
-        # Create logs container if it doesn't exist
-        $logsContainer = Get-AzStorageContainer -Name 'logs' -Context $destinationContext -ErrorAction SilentlyContinue
-        if (-not $logsContainer) {
-            New-AzStorageContainer -Name 'logs' -Context $destinationContext -Permission Off | Out-Null
+                # Upload job output
+                Set-AzStorageBlobContent -File $logPath -Container 'logs' -Blob $logFileName -Context $destinationContext -Force | Out-Null
+                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Job output uploaded: $logFileName"
+
+                # Clean up local file
+                Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Could not find automation account for job ID: $jobId"
+            }
+        } catch {
+            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload job output: $($_.Exception.Message)"
         }
-
-        # Upload transcript
-        Set-AzStorageBlobContent -File $transcriptPath -Container 'logs' -Blob $transcriptFileName -Context $destinationContext -Force | Out-Null
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Transcript uploaded: $transcriptFileName"
-
-        # Clean up local transcript
-        Remove-Item -Path $transcriptPath -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload transcript: $($_.Exception.Message)"
+    } else {
+        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Job ID not available, skipping job output upload"
     }
 }
