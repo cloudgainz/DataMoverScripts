@@ -23,6 +23,11 @@ else {
     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
 }
 
+# Start transcript to capture all output
+$transcriptFileName = "transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$transcriptPath = Join-Path $env:TEMP $transcriptFileName
+Start-Transcript -Path $transcriptPath -Force
+
 # (get-date).ToString('o') | clip
 # V 2026-02-12T17:56:13.2549460-07:00
 
@@ -192,8 +197,7 @@ function Invoke-DataMover {
                     $successCount++
                     Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]   ✓ Success"
                     $copiedFiles += $sourceBlobName
-                }
-                else {
+                } else {
                     $errorCount++
                     $errorMsg = "Failed with status: $($copyState.Status)"
                     Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]   ✗ $errorMsg"
@@ -273,4 +277,34 @@ catch {
     Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runbook execution failed: $($_.Exception.Message)"
     Write-Error "Stack trace: $($_.ScriptStackTrace)"
     throw
+}
+finally {
+    # Stop transcript and upload to logs container
+    try {
+        Stop-Transcript
+    } catch {
+        Write-Warning "Failed to stop transcript: $($_.Exception.Message)"
+    }
+
+    try {
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Uploading transcript to logs container..."
+        $customerStorageAccount = $parameterTable.customerStorageAccount
+        $customerToken = $parameterTable.customerToken
+        $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
+
+        # Create logs container if it doesn't exist
+        $logsContainer = Get-AzStorageContainer -Name 'logs' -Context $destinationContext -ErrorAction SilentlyContinue
+        if (-not $logsContainer) {
+            New-AzStorageContainer -Name 'logs' -Context $destinationContext -Permission Off | Out-Null
+        }
+
+        # Upload transcript
+        Set-AzStorageBlobContent -File $transcriptPath -Container 'logs' -Blob $transcriptFileName -Context $destinationContext -Force | Out-Null
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Transcript uploaded: $transcriptFileName"
+
+        # Clean up local transcript
+        Remove-Item -Path $transcriptPath -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload transcript: $($_.Exception.Message)"
+    }
 }
