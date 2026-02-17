@@ -65,9 +65,9 @@ function Invoke-DataMover {
     )
 
     # Start transcript to capture all output
-    $transcriptFileName = "transcript_output_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    $transcriptPath = Join-Path $env:TEMP $transcriptFileName
-    Start-Transcript -Path $transcriptPath -Force
+    $transcriptOutFileName = "transcript_output_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $transcriptOutPath = Join-Path $env:TEMP $transcriptOutFileName
+    Start-Transcript -Path $transcriptOutPath -Force
 
     $jobStartTime = Get-Date
     $errors = @()
@@ -278,11 +278,11 @@ function Invoke-DataMover {
         }
 
         # Upload transcript
-        Set-AzStorageBlobContent -File $transcriptPath -Container 'logs' -Blob $transcriptFileName -Context $destinationContext -Force | Out-Null
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Transcript uploaded: $transcriptFileName"
+        Set-AzStorageBlobContent -File $transcriptOutPath -Container 'logs' -Blob $transcriptOutFileName -Context $destinationContext -Force | Out-Null
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Transcript uploaded: $transcriptOutFileName"
 
         # Clean up local transcript
-        Remove-Item -Path $transcriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $transcriptOutPath -Force -ErrorAction SilentlyContinue
     } catch {
         Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload transcript: $($_.Exception.Message)"
     }
