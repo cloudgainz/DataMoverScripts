@@ -3,64 +3,85 @@ param(
     [int] $days = 1
 )
 
+# Initialize log capture array
+$script:logEntries = @()
+
+# Custom logging function that captures to both console and array
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('Output', 'Warning', 'Error')]
+        [string]$Level = 'Output'
+    )
+    
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logEntry = "[$timestamp] [$Level] $Message"
+    
+    # Add to log array
+    $script:logEntries += $logEntry
+    
+    # Write to console
+    switch ($Level) {
+        'Output'  { Write-Output "[$timestamp] $Message" }
+        'Warning' { Write-Warning "[$timestamp] $Message" }
+        'Error'   { Write-Error "[$timestamp] $Message" }
+    }
+}
+
 # If called via webhook, extract parameters from WebhookData
 if ($WebhookData) {
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called via webhook"
+    Write-Log "Called via webhook"
     if ($WebhookData.RequestBody) {
         try {
             $webhookParams = $WebhookData.RequestBody | ConvertFrom-Json
             if ($webhookParams.days) {
                 $days = [int]$webhookParams.days
-                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Using webhook parameter: days=$days"
+                Write-Log "Using webhook parameter: days=$days"
             }
         }
         catch {
-            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to parse webhook parameters: $($_.Exception.Message)"
+            Write-Log "Failed to parse webhook parameters: $($_.Exception.Message)" -Level Warning
         }
     }
 }
 else {
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Called directly (not via webhook), using days=$days"
+    Write-Log "Called directly (not via webhook), using days=$days"
 }
 
-# Get the current job context for later retrieval of job output
+# Get job ID for log filename
 $jobId = $null
-$automationAccountName = $null
-$resourceGroupName = $null
-
 try {
-    # Try to get job ID from the automation context
     $jobId = $PSPrivateMetadata.JobId.Guid
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Job ID: $jobId"
+    Write-Log "Job ID: $jobId"
 } catch {
-    Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Could not retrieve job ID: $($_.Exception.Message)"
+    Write-Log "Could not retrieve job ID: $($_.Exception.Message)" -Level Warning
 }
 
 # (get-date).ToString('o') | clip
-# V 2026-02-17T17:29:08.5007826-07:00
+# V 2026-02-17T18:29:21.7305131-07:00
 
 # Authenticate using the automation account's managed identity
 try {
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting runbook execution"
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Authenticating with managed identity..."
+    Write-Log "Starting runbook execution"
+    Write-Log "Authenticating with managed identity..."
     Connect-AzAccount -Identity | Out-Null
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Successfully authenticated"
+    Write-Log "✓ Successfully authenticated"
 }
 catch {
-    Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to authenticate: $($_.Exception.Message)"
-    Write-Error "Stack trace: $($_.ScriptStackTrace)"
+    Write-Log "Failed to authenticate: $($_.Exception.Message)" -Level Error
+    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
     throw
 }
 
 # Retrieve parameter table from automation variable
 try {
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving parameter table from automation variable..."
+    Write-Log "Retrieving parameter table from automation variable..."
     [hashtable]$parameterTable = Get-AutomationVariable -Name XXSITETABLEXX | ConvertFrom-Json -AsHashtable
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Parameter table retrieved successfully"
+    Write-Log "✓ Parameter table retrieved successfully"
 }
 catch {
-    Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to retrieve parameter table: $($_.Exception.Message)"
-    Write-Error "Stack trace: $($_.ScriptStackTrace)"
+    Write-Log "Failed to retrieve parameter table: $($_.Exception.Message)" -Level Error
+    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
     throw
 }
 
@@ -82,7 +103,7 @@ function Invoke-DataMover {
     $copiedFiles = @()
     
     try {
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting data mover operation"
+        Write-Log "Starting data mover operation"
         
         # tease out parameters that I care about
         $exportStorageAccount = $parameterTable.exportStorageAccount
@@ -96,14 +117,14 @@ function Invoke-DataMover {
 
         $normalizedPath = $exportsDirectory.Trim('/')
 
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Configuration:"
-        Write-Output "  Site: $siteName"
-        Write-Output "  Source: $exportStorageAccount/$exportStorageContainer/$normalizedPath"
-        Write-Output "  Destination: $customerStorageAccount/$($siteName.ToLower())"
-        Write-Output "  Days: $days"
+        Write-Log "Configuration:"
+        Write-Log "  Site: $siteName"
+        Write-Log "  Source: $exportStorageAccount/$exportStorageContainer/$normalizedPath"
+        Write-Log "  Destination: $customerStorageAccount/$($siteName.ToLower())"
+        Write-Log "  Days: $days"
 
         # Validate required parameters
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Validating parameters..."
+        Write-Log "Validating parameters..."
         if ([string]::IsNullOrWhiteSpace($exportStorageAccount)) { throw "exportStorageAccount is required" }
         if ([string]::IsNullOrWhiteSpace($exportStorageContainer)) { throw "exportStorageContainer is required" }
         if ([string]::IsNullOrWhiteSpace($exportsDirectory)) { throw "exportsDirectory is required" }
@@ -112,7 +133,7 @@ function Invoke-DataMover {
         if ([string]::IsNullOrWhiteSpace($subscriptionName)) { throw "subscriptionName is required" }
         if ([string]::IsNullOrWhiteSpace($location)) { throw "location is required" }
         if ([string]::IsNullOrWhiteSpace($siteName)) { throw "siteName is required" }
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ All parameters validated"
+        Write-Log "✓ All parameters validated"
 
         # Create source storage context using managed identity
         # Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to source storage account using managed identity..."
@@ -120,32 +141,32 @@ function Invoke-DataMover {
         # Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to source storage account"
 
         # Create source storage context using managed identity via Get-AzStorageAccount
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving storage account object for $exportStorageAccount..."
+        Write-Log "Retrieving storage account object for $exportStorageAccount..."
         $storageAccountObj = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount } | Select-Object -First 1
         if (-not $storageAccountObj) {
             throw "Storage account '$exportStorageAccount' not found. Ensure the Automation Account has Reader permission on the storage account."
         }
         $sourceContext = $storageAccountObj.Context
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Using storage account context: $($storageAccountObj.Id)"
+        Write-Log "✓ Using storage account context: $($storageAccountObj.Id)"
 
         # Create destination context using SAS token
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connecting to destination storage account..."
+        Write-Log "Connecting to destination storage account..."
         $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Connected to destination storage account"
+        Write-Log "✓ Connected to destination storage account"
 
         # Get all blobs from source
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Listing blobs in source..."
+        Write-Log "Listing blobs in source..."
         $allBlobs = Get-AzStorageBlob -Container $exportStorageContainer -Context $sourceContext -Prefix $normalizedPath
 
         # Report unfiltered blob count (before pruning/filtering)
         $unfilteredCount = if ($allBlobs) { ($allBlobs | Measure-Object).Count } else { 0 }
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Unfiltered blobs found: $unfilteredCount in $exportStorageContainer/$normalizedPath"
+        Write-Log "Unfiltered blobs found: $unfilteredCount in $exportStorageContainer/$normalizedPath"
 
         $pruneDate = (Get-Date).addDays(-$days)
         $allBlobs = $allBlobs | Where-Object {$_.LastModified -gt $pruneDate}
 
         $filteredCount = if ($allBlobs) { ($allBlobs | Measure-Object).Count } else { 0 }
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Filtered blobs found: $filteredCount in $exportStorageContainer/$normalizedPath"
+        Write-Log "Filtered blobs found: $filteredCount in $exportStorageContainer/$normalizedPath"
         
         # Filter out directory marker blobs (those ending with / or with 0 length that represent folders)
         $sourceBlobs = $allBlobs | Where-Object { 
@@ -153,7 +174,7 @@ function Invoke-DataMover {
         }
 
         if (-not $sourceBlobs -or $sourceBlobs.Count -eq 0) {
-            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] No blobs found in $exportStorageContainer/$normalizedPath"
+            Write-Log "No blobs found in $exportStorageContainer/$normalizedPath" -Level Warning
             return [PSCustomObject]@{
                 Status = "Success"
                 Message = "No files to copy"
@@ -166,32 +187,32 @@ function Invoke-DataMover {
             }
         }
 
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Found $($sourceBlobs.Count) file blob(s) to copy"
+        Write-Log "Found $($sourceBlobs.Count) file blob(s) to copy"
 
         # Create destination container if needed
         $containerName = $siteName.ToLower()
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Checking destination container: $containerName"
+        Write-Log "Checking destination container: $containerName"
         $destinationContainer = Get-AzStorageContainer -Name $containerName -Context $destinationContext -ErrorAction SilentlyContinue
         if (-not $destinationContainer) {
-            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Creating destination container: $containerName"
+            Write-Log "Creating destination container: $containerName"
             New-AzStorageContainer -Name $containerName -Context $destinationContext -Permission Off | Out-Null
-            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Container created"
+            Write-Log "✓ Container created"
         } else {
-            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Container already exists"
+            Write-Log "✓ Container already exists"
         }
 
         # Copy blobs preserving full directory structure
         $successCount = 0
         $errorCount = 0
 
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting blob copy operations..."
+        Write-Log "Starting blob copy operations..."
         foreach ($blob in $sourceBlobs) {
             try {
                 # Use full blob name to preserve directory structure
                 $sourceBlobName = $blob.Name
                 $destBlobName = $sourceBlobName  # Keeps the full path including exportsDirectory
                 
-                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Copying: $sourceBlobName"
+                Write-Log "Copying: $sourceBlobName"
                 
                 # Start async copy operation
                 $copyOperation = Start-AzStorageBlobCopy `
@@ -208,12 +229,12 @@ function Invoke-DataMover {
                 
                 if ($copyState.Status -eq "Success") {
                     $successCount++
-                    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]   ✓ Success"
+                    Write-Log "  ✓ Success"
                     $copiedFiles += $sourceBlobName
                 } else {
                     $errorCount++
                     $errorMsg = "Failed with status: $($copyState.Status)"
-                    Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]   ✗ $errorMsg"
+                    Write-Log "  ✗ $errorMsg" -Level Error
                     $errors += [PSCustomObject]@{
                         File = $sourceBlobName
                         Error = $errorMsg
@@ -223,7 +244,7 @@ function Invoke-DataMover {
             catch {
                 $errorCount++
                 $errorMsg = $_.Exception.Message
-                Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]   ✗ Error: $errorMsg"
+                Write-Log "  ✗ Error: $errorMsg" -Level Error
                 $errors += [PSCustomObject]@{
                     File = $sourceBlobName
                     Error = $errorMsg
@@ -235,17 +256,17 @@ function Invoke-DataMover {
         $jobEndTime = Get-Date
         $duration = $jobEndTime - $jobStartTime
         
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ========================================="
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] DATA MOVER OPERATION COMPLETE"
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ========================================="
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Total blobs: $($sourceBlobs.Count)"
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Successful: $successCount"
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed: $errorCount"
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Duration: $($duration.ToString())"
-        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ========================================="
+        Write-Log "========================================="
+        Write-Log "DATA MOVER OPERATION COMPLETE"
+        Write-Log "========================================="
+        Write-Log "Total blobs: $($sourceBlobs.Count)"
+        Write-Log "Successful: $successCount"
+        Write-Log "Failed: $errorCount"
+        Write-Log "Duration: $($duration.ToString())"
+        Write-Log "========================================="
         
         if ($errorCount -gt 0) {
-            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Job completed with $errorCount error(s)"
+            Write-Log "Job completed with $errorCount error(s)" -Level Warning
         }
 
         return [PSCustomObject]@{
@@ -263,13 +284,13 @@ function Invoke-DataMover {
         $jobEndTime = Get-Date
         $duration = $jobEndTime - $jobStartTime
         
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ========================================="
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] DATA MOVER OPERATION FAILED"
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ========================================="
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Error: $($_.Exception.Message)"
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Stack trace: $($_.ScriptStackTrace)"
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Duration: $($duration.ToString())"
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ========================================="
+        Write-Log "=========================================" -Level Error
+        Write-Log "DATA MOVER OPERATION FAILED" -Level Error
+        Write-Log "=========================================" -Level Error
+        Write-Log "Error: $($_.Exception.Message)" -Level Error
+        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
+        Write-Log "Duration: $($duration.ToString())" -Level Error
+        Write-Log "=========================================" -Level Error
         
         throw
     }
@@ -305,95 +326,61 @@ function Invoke-DataMover {
 
 # Execute the data mover
 try {
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Setting Azure subscription context: $($parameterTable.subscriptionName)"
+    Write-Log "Setting Azure subscription context: $($parameterTable.subscriptionName)"
     Set-AzContext -Subscription $parameterTable.subscriptionName | Out-Null
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Subscription context set"
+    Write-Log "✓ Subscription context set"
     
     $result = Invoke-DataMover -parameterTable $parameterTable -days $days
     
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runbook execution completed successfully"
+    Write-Log "Runbook execution completed successfully"
     Write-Output ($result | ConvertTo-Json -Depth 10)
 }
 catch {
-    Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runbook execution failed: $($_.Exception.Message)"
-    Write-Error "Stack trace: $($_.ScriptStackTrace)"
+    Write-Log "Runbook execution failed: $($_.Exception.Message)" -Level Error
+    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
     throw
 }
 finally {
-    # Retrieve and upload Azure Automation job output to logs container
-    if ($jobId -and $parameterTable) {
+    # Upload captured log entries to storage container
+    if ($parameterTable -and $script:logEntries -and $script:logEntries.Count -gt 0) {
         try {
-            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving job output from Azure Automation..."
+            Write-Log "Uploading job log to storage..."
             
-            # Derive automation account details from parameter table
-            $siteName = $parameterTable.siteName
-            $automationAccountName = "$siteName-aa"
-            $resourceGroupName = $parameterTable.runBookRG
+            # Build the complete output log
+            $outputLog = @()
+            $outputLog += "======================================"
+            $outputLog += "Azure Automation Runbook Log"
+            $outputLog += "Job ID: $jobId"
+            $outputLog += "Site: $($parameterTable.siteName)"
+            $outputLog += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            $outputLog += "======================================"
+            $outputLog += ""
+            $outputLog += $script:logEntries
             
-            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Using automation account: $automationAccountName in resource group: $resourceGroupName"
+            # Save to temp file
+            $logFileName = "job_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+            $logPath = Join-Path $env:TEMP $logFileName
+            $outputLog | Out-File -FilePath $logPath -Encoding UTF8
             
-            if ($automationAccountName -and $resourceGroupName) {
-                
-                # Retrieve all job output streams
-                $jobOutput = Get-AzAutomationJobOutput -ResourceGroupName $resourceGroupName `
-                    -AutomationAccountName $automationAccountName `
-                    -Id $jobId `
-                    -Stream Any
-                
-                # Build the complete output log
-                $outputLog = @()
-                $outputLog += "======================================"
-                $outputLog += "Azure Automation Job Output Log"
-                $outputLog += "Job ID: $jobId"
-                $outputLog += "Automation Account: $automationAccountName"
-                $outputLog += "Resource Group: $resourceGroupName"
-                $outputLog += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-                $outputLog += "======================================"
-                $outputLog += ""
-                
-                foreach ($output in $jobOutput) {
-                    $outputDetail = Get-AzAutomationJobOutputRecord -ResourceGroupName $resourceGroupName `
-                        -AutomationAccountName $automationAccountName `
-                        -JobId $jobId `
-                        -Id $output.StreamRecordId
-                    
-                    $timestamp = $output.Time.ToString('yyyy-MM-dd HH:mm:ss')
-                    $stream = $output.Type
-                    $message = $outputDetail.Value.Values -join ' '
-                    
-                    $outputLog += "[$timestamp] [$stream] $message"
-                }
-                
-                # Save to temp file
-                $logFileName = "job_output_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-                $logPath = Join-Path $env:TEMP $logFileName
-                $outputLog | Out-File -FilePath $logPath -Encoding UTF8
-                
-                # Upload to storage
-                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Uploading job output to logs container..."
-                $customerStorageAccount = $parameterTable.customerStorageAccount
-                $customerToken = $parameterTable.customerToken
-                $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
+            # Upload to storage
+            $customerStorageAccount = $parameterTable.customerStorageAccount
+            $customerToken = $parameterTable.customerToken
+            $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
 
-                # Create logs container if it doesn't exist
-                $logsContainer = Get-AzStorageContainer -Name 'logs' -Context $destinationContext -ErrorAction SilentlyContinue
-                if (-not $logsContainer) {
-                    New-AzStorageContainer -Name 'logs' -Context $destinationContext -Permission Off | Out-Null
-                }
-
-                # Upload job output
-                Set-AzStorageBlobContent -File $logPath -Container 'logs' -Blob $logFileName -Context $destinationContext -Force | Out-Null
-                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ✓ Job output uploaded: $logFileName"
-
-                # Clean up local file
-                Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
-            } else {
-                Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Could not determine automation account details from parameter table."
+            # Create logs container if it doesn't exist
+            $logsContainer = Get-AzStorageContainer -Name 'logs' -Context $destinationContext -ErrorAction SilentlyContinue
+            if (-not $logsContainer) {
+                New-AzStorageContainer -Name 'logs' -Context $destinationContext -Permission Off | Out-Null
             }
+
+            # Upload job log
+            Set-AzStorageBlobContent -File $logPath -Container 'logs' -Blob $logFileName -Context $destinationContext -Force | Out-Null
+            Write-Log "✓ Job log uploaded: $logFileName"
+
+            # Clean up local file
+            Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
         } catch {
-            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload job output: $($_.Exception.Message)"
+            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload job log: $($_.Exception.Message)"
         }
-    } else {
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Job ID not available, skipping job output upload"
     }
 }
