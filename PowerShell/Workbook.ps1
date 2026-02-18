@@ -325,21 +325,14 @@ finally {
         try {
             Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving job output from Azure Automation..."
             
-            # Give the job a moment to finalize output
-            Start-Sleep -Seconds 5
+            # Derive automation account details from parameter table
+            $siteName = $parameterTable.siteName
+            $automationAccountName = "$siteName-aa"
+            $resourceGroupName = $parameterTable.runBookRG
             
-            # Get automation account details from the current context
-            $automationAccounts = Get-AzAutomationAccount
-            $currentAccount = $automationAccounts | Where-Object {
-                $jobs = Get-AzAutomationJob -ResourceGroupName $_.ResourceGroupName -AutomationAccountName $_.AutomationAccountName -Id $jobId -ErrorAction SilentlyContinue
-                $null -ne $jobs
-            } | Select-Object -First 1
+            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Using automation account: $automationAccountName in resource group: $resourceGroupName"
             
-            if ($currentAccount) {
-                $automationAccountName = $currentAccount.AutomationAccountName
-                $resourceGroupName = $currentAccount.ResourceGroupName
-                
-                Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Found automation account: $automationAccountName in resource group: $resourceGroupName"
+            if ($automationAccountName -and $resourceGroupName) {
                 
                 # Retrieve all job output streams
                 $jobOutput = Get-AzAutomationJobOutput -ResourceGroupName $resourceGroupName `
@@ -395,7 +388,7 @@ finally {
                 # Clean up local file
                 Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
             } else {
-                Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Could not find automation account for job ID: $jobId"
+                Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Could not determine automation account details from parameter table."
             }
         } catch {
             Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to upload job output: $($_.Exception.Message)"
