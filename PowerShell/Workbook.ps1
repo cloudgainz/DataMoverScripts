@@ -37,7 +37,7 @@ try {
 }
 
 # (get-date).ToString('o') | clip
-# V 2026-02-12T17:56:13.2549460-07:00
+# V 2026-02-17T17:29:08.5007826-07:00
 
 # Authenticate using the automation account's managed identity
 try {
