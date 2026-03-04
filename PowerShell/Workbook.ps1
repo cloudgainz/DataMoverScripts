@@ -13,19 +13,15 @@ function Write-Log {
         [ValidateSet('Output', 'Warning', 'Error')]
         [string]$Level = 'Output'
     )
-    
+
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logEntry = "[$timestamp] [$Level] $Message"
-    
+
     # Add to log array
     $script:logEntries += $logEntry
-    
-    # Write to console
-    switch ($Level) {
-        'Output'  { Write-Output "[$timestamp] $Message" }
-        'Warning' { Write-Warning "[$timestamp] $Message" }
-        'Error'   { Write-Error "[$timestamp] $Message" }
-    }
+
+    # Write to console using only Write-Output (avoids ANSI codes)
+    Write-Output "[$timestamp] [$Level] $Message"
 }
 
 # If called via webhook, extract parameters from WebhookData
@@ -65,7 +61,7 @@ try {
     Write-Log "Starting runbook execution"
     Write-Log "Authenticating with managed identity..."
     Connect-AzAccount -Identity | Out-Null
-    Write-Log "✓ Successfully authenticated"
+    Write-Log "[OK] Successfully authenticated"
 }
 catch {
     Write-Log "Failed to authenticate: $($_.Exception.Message)" -Level Error
@@ -77,7 +73,7 @@ catch {
 try {
     Write-Log "Retrieving parameter table from automation variable..."
     [hashtable]$parameterTable = Get-AutomationVariable -Name XXSITETABLEXX | ConvertFrom-Json -AsHashtable
-    Write-Log "✓ Parameter table retrieved successfully"
+    Write-Log "[OK] Parameter table retrieved successfully"
 }
 catch {
     Write-Log "Failed to retrieve parameter table: $($_.Exception.Message)" -Level Error
@@ -104,7 +100,9 @@ function Invoke-DataMover {
     
     try {
         Write-Log "Starting data mover operation"
-        
+        Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
+        Write-Log "Execution Environment: $($PSVersionTable.Platform)"
+
         # tease out parameters that I care about
         $exportStorageAccount = $parameterTable.exportStorageAccount
         $exportStorageContainer = $parameterTable.exportStorageContainer
@@ -116,6 +114,14 @@ function Invoke-DataMover {
         $siteName = $parameterTable.siteName
 
         $normalizedPath = $exportsDirectory.Trim('/')
+
+        Write-Log "Parameters extracted:"
+        Write-Log "  exportStorageAccount: $exportStorageAccount"
+        Write-Log "  exportStorageContainer: $exportStorageContainer"
+        Write-Log "  customerStorageAccount: $customerStorageAccount"
+        Write-Log "  subscriptionName: $subscriptionName"
+        Write-Log "  siteName: $siteName"
+        Write-Log "  location: $location"
 
         Write-Log "Configuration:"
         Write-Log "  Site: $siteName"
@@ -147,12 +153,16 @@ function Invoke-DataMover {
             throw "Storage account '$exportStorageAccount' not found. Ensure the Automation Account has Reader permission on the storage account."
         }
         $sourceContext = $storageAccountObj.Context
-        Write-Log "✓ Using storage account context: $($storageAccountObj.Id)"
+        Write-Log "[OK] Storage account lookup successful"
+        Write-Log "  Account Name: $($storageAccountObj.StorageAccountName)"
+        Write-Log "  Account ID: $($storageAccountObj.Id)"
+        Write-Log "  Account Kind: $($storageAccountObj.Kind)"
+        Write-Log "[OK] Using storage account context: $($storageAccountObj.Id)"
 
         # Create destination context using SAS token
         Write-Log "Connecting to destination storage account..."
         $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
-        Write-Log "✓ Connected to destination storage account"
+        Write-Log "[OK] Connected to destination storage account"
 
         # Get all blobs from source
         Write-Log "Listing blobs in source..."
@@ -196,24 +206,25 @@ function Invoke-DataMover {
         if (-not $destinationContainer) {
             Write-Log "Creating destination container: $containerName"
             New-AzStorageContainer -Name $containerName -Context $destinationContext -Permission Off | Out-Null
-            Write-Log "✓ Container created"
+            Write-Log "[OK] Container created"
         } else {
-            Write-Log "✓ Container already exists"
+            Write-Log "[OK] Container already exists"
         }
 
         # Copy blobs preserving full directory structure
         $successCount = 0
         $errorCount = 0
 
-        Write-Log "Starting blob copy operations..."
+        Write-Log "Starting blob copy operations for $($sourceBlobs.Count) blob(s)..."
         foreach ($blob in $sourceBlobs) {
             try {
                 # Use full blob name to preserve directory structure
                 $sourceBlobName = $blob.Name
                 $destBlobName = $sourceBlobName  # Keeps the full path including exportsDirectory
-                
+
+                Write-Log "Blob details - Name: $sourceBlobName, Size: $($blob.Length) bytes, LastModified: $($blob.LastModified)"
                 Write-Log "Copying: $sourceBlobName"
-                
+
                 # Start async copy operation
                 $copyOperation = Start-AzStorageBlobCopy `
                     -Context $sourceContext `
@@ -223,18 +234,25 @@ function Invoke-DataMover {
                     -DestContainer $containerName `
                     -DestBlob $destBlobName `
                     -Force
-                
+
+                Write-Log "  Copy operation initiated"
+
                 # Wait for copy to complete
                 $copyState = $copyOperation | Get-AzStorageBlobCopyState -WaitForComplete
-                
+
+                if ($copyState.BytesCopied) {
+                    Write-Log "  Copy progress: $($copyState.BytesCopied) bytes"
+                }
+                Write-Log "  Copy status: $($copyState.Status)"
+
                 if ($copyState.Status -eq "Success") {
                     $successCount++
-                    Write-Log "  ✓ Success"
+                    Write-Log "  [OK] Success - Blob copied successfully"
                     $copiedFiles += $sourceBlobName
                 } else {
                     $errorCount++
                     $errorMsg = "Failed with status: $($copyState.Status)"
-                    Write-Log "  ✗ $errorMsg" -Level Error
+                    Write-Log "  [FAILED] $errorMsg" -Level Error
                     $errors += [PSCustomObject]@{
                         File = $sourceBlobName
                         Error = $errorMsg
@@ -244,7 +262,10 @@ function Invoke-DataMover {
             catch {
                 $errorCount++
                 $errorMsg = $_.Exception.Message
-                Write-Log "  ✗ Error: $errorMsg" -Level Error
+                Write-Log "  [FAILED] Exception during blob copy for: $sourceBlobName" -Level Error
+                Write-Log "  Exception type: $($_.Exception.GetType().Name)" -Level Error
+                Write-Log "  Error message: $errorMsg" -Level Error
+                Write-Log "  Stack trace: $($_.ScriptStackTrace)" -Level Error
                 $errors += [PSCustomObject]@{
                     File = $sourceBlobName
                     Error = $errorMsg
@@ -267,7 +288,11 @@ function Invoke-DataMover {
         
         if ($errorCount -gt 0) {
             Write-Log "Job completed with $errorCount error(s)" -Level Warning
+        } else {
+            Write-Log "Job completed successfully with no errors"
         }
+
+        Write-Log "Final result: TotalBlobs=$($sourceBlobs.Count), Successful=$successCount, Failed=$errorCount"
 
         return [PSCustomObject]@{
             Status = if ($errorCount -eq 0) { "Success" } else { "PartialSuccess" }
@@ -328,7 +353,7 @@ function Invoke-DataMover {
 try {
     Write-Log "Setting Azure subscription context: $($parameterTable.subscriptionName)"
     Set-AzContext -Subscription $parameterTable.subscriptionName | Out-Null
-    Write-Log "✓ Subscription context set"
+    Write-Log "[OK] Subscription context set"
     
     $result = Invoke-DataMover -parameterTable $parameterTable -days $days
     
@@ -375,7 +400,7 @@ finally {
 
             # Upload job log
             Set-AzStorageBlobContent -File $logPath -Container 'logs' -Blob $logFileName -Context $destinationContext -Force | Out-Null
-            Write-Log "✓ Job log uploaded: $logFileName"
+            Write-Log "[OK] Job log uploaded: $logFileName"
 
             # Clean up local file
             Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
