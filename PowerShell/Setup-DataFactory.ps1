@@ -51,6 +51,13 @@ $usePrivateEndpoint = -not [string]::IsNullOrWhiteSpace($vnetSubnetId)
 
 [DateTime]$ScheduleStartTime = (Get-Date).AddDays(1).Date.AddHours(2)
 
+# Webhook / remote-trigger variables (populated in Step 9)
+$webhookSPName      = $null
+$webhookTenantId    = $null
+$webhookClientId    = $null
+$webhookClientSecret = $null
+$webhookTriggerUri  = $null
+
 if ($usePrivateEndpoint) {
     Write-Host "Mode: Managed VNet + Private Endpoint (vnetSubnetId detected)" -ForegroundColor Magenta
     Write-Host "  Subnet: $vnetSubnetId" -ForegroundColor Gray
@@ -385,6 +392,47 @@ try {
     # The pipeline has a 'days' parameter (default 7).
     # The Copy activity filters source blobs by LastModified >= (now - days).
     # Binary copy with recursive=true preserves full folder hierarchy.
+    # After the copy, two Web activities write a run-summary JSON blob to
+    # customerStorageAccount/logs/{siteName}-{RunId}.json via the SAS token.
+    #
+    # Body objects use ADF @{expression} interpolation inside string values —
+    # ADF substitutes each @{...} at runtime, so no concat() expressions needed.
+    # PowerShell serializes these hashtables to JSON via New-TempAdfJson.
+    $logBlobUrlExpr = "@concat('https://$customerStorageAccount.blob.core.windows.net/logs/$siteName-', pipeline().RunId, '.json?$customerToken')"
+
+    $successBody = @{
+        runId               = "@{pipeline().RunId}"
+        pipeline            = "@{pipeline().Pipeline}"
+        triggerTime         = "@{string(pipeline().TriggerTime)}"
+        status              = "Succeeded"
+        dataReadBytes       = "@{activity('CopyBlobs').output.dataRead}"
+        dataWrittenBytes    = "@{activity('CopyBlobs').output.dataWritten}"
+        filesRead           = "@{activity('CopyBlobs').output.filesRead}"
+        filesWritten        = "@{activity('CopyBlobs').output.filesWritten}"
+        copyDurationSeconds = "@{activity('CopyBlobs').output.copyDuration}"
+        throughputMBps      = "@{activity('CopyBlobs').output.throughput}"
+    }
+
+    $failureBody = @{
+        runId        = "@{pipeline().RunId}"
+        pipeline     = "@{pipeline().Pipeline}"
+        triggerTime  = "@{string(pipeline().TriggerTime)}"
+        status       = "Failed"
+        errorCode    = "@{activity('CopyBlobs').error.errorCode}"
+        errorMessage = "@{activity('CopyBlobs').error.message}"
+    }
+
+    # Body for when the logging activity itself errors (CopyBlobs succeeded but WriteSuccessLog failed)
+    $logErrorBody = @{
+        runId        = "@{pipeline().RunId}"
+        pipeline     = "@{pipeline().Pipeline}"
+        triggerTime  = "@{string(pipeline().TriggerTime)}"
+        status       = "LoggingError"
+        errorCode    = "@{activity('WriteSuccessLog').error.errorCode}"
+        errorMessage = "@{activity('WriteSuccessLog').error.message}"
+        note         = "CopyBlobs succeeded but the success log write failed"
+    }
+
     $pipelineDef = @{
         name       = $PipelineName
         properties = @{
@@ -429,6 +477,63 @@ try {
                                 type = "AzureBlobStorageWriteSettings"
                             }
                         }
+                    }
+                },
+                # ------------------------------------------------------------------
+                # WriteSuccessLog: PUT a JSON summary blob on successful copy
+                # ------------------------------------------------------------------
+                @{
+                    name      = "WriteSuccessLog"
+                    type      = "WebActivity"
+                    dependsOn = @(
+                        @{ activity = "CopyBlobs"; dependencyConditions = @("Succeeded") }
+                    )
+                    typeProperties = @{
+                        url    = @{ value = $logBlobUrlExpr; type = "Expression" }
+                        method = "PUT"
+                        headers = @{
+                            "x-ms-blob-type" = "BlockBlob"
+                            "Content-Type"   = "application/json"
+                        }
+                        body = $successBody
+                    }
+                },
+                # ------------------------------------------------------------------
+                # WriteFailureLog: PUT a JSON error summary blob on failed copy
+                # ------------------------------------------------------------------
+                @{
+                    name      = "WriteFailureLog"
+                    type      = "WebActivity"
+                    dependsOn = @(
+                        @{ activity = "CopyBlobs"; dependencyConditions = @("Failed") }
+                    )
+                    typeProperties = @{
+                        url    = @{ value = $logBlobUrlExpr; type = "Expression" }
+                        method = "PUT"
+                        headers = @{
+                            "x-ms-blob-type" = "BlockBlob"
+                            "Content-Type"   = "application/json"
+                        }
+                        body = $failureBody
+                    }
+                },
+                # ------------------------------------------------------------------
+                # WriteLogError: fallback if WriteSuccessLog itself fails
+                # ------------------------------------------------------------------
+                @{
+                    name      = "WriteLogError"
+                    type      = "WebActivity"
+                    dependsOn = @(
+                        @{ activity = "WriteSuccessLog"; dependencyConditions = @("Failed") }
+                    )
+                    typeProperties = @{
+                        url    = @{ value = $logBlobUrlExpr; type = "Expression" }
+                        method = "PUT"
+                        headers = @{
+                            "x-ms-blob-type" = "BlockBlob"
+                            "Content-Type"   = "application/json"
+                        }
+                        body = $logErrorBody
                     }
                 }
             )
@@ -488,6 +593,67 @@ try {
     Write-Host "  Schedule: Daily at $($ScheduleStartTime.ToString('HH:mm')) ($((Get-TimeZone).Id))" -ForegroundColor Gray
 
     # =========================================================================
+    # Step 9: Create Service Principal for remote / webhook pipeline triggering
+    # =========================================================================
+    Write-Host "`n[9] Creating webhook Service Principal" -ForegroundColor Cyan
+
+    $webhookSPName   = "$DataFactoryName-trigger-sp"
+    $adfResourceId   = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$DataFactoryName"
+    $webhookTriggerUri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$DataFactoryName/pipelines/$PipelineName/createRun?api-version=2018-06-01"
+
+    # Check for an existing app with this name
+    $existingApp = Get-AzADApplication -DisplayName $webhookSPName -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if (-not $existingApp) {
+        Write-Host "Creating app registration: $webhookSPName..." -ForegroundColor Yellow
+        $webhookApp = New-AzADApplication -DisplayName $webhookSPName
+    } else {
+        Write-Host "App registration already exists: $webhookSPName" -ForegroundColor Yellow
+        $webhookApp = $existingApp
+    }
+
+    # Ensure a Service Principal exists for the app
+    $webhookSP = Get-AzADServicePrincipal -ApplicationId $webhookApp.AppId -ErrorAction SilentlyContinue
+    if (-not $webhookSP) {
+        Write-Host "Creating service principal..." -ForegroundColor Yellow
+        $webhookSP = New-AzADServicePrincipal -ApplicationId $webhookApp.AppId
+        Start-Sleep -Seconds 10  # Allow SP to propagate
+    }
+
+    # Generate a new client secret (valid 2 years)
+    Write-Host "Generating client secret (2-year expiry)..." -ForegroundColor Yellow
+    $credResult      = New-AzADAppCredential -ApplicationId $webhookApp.AppId -EndDate (Get-Date).AddYears(2)
+    $webhookClientSecret = $credResult.SecretText
+    $webhookClientId     = $webhookApp.AppId
+    $webhookTenantId     = (Get-AzContext).Tenant.Id
+
+    # Assign Data Factory Contributor on this ADF so the SP can trigger pipeline runs
+    $existingSpRole = Get-AzRoleAssignment -ObjectId $webhookSP.Id -RoleDefinitionName "Data Factory Contributor" -Scope $adfResourceId -ErrorAction SilentlyContinue
+    if (-not $existingSpRole) {
+        $spRoleRetry = 0
+        while ($spRoleRetry -lt 5) {
+            try {
+                New-AzRoleAssignment -ObjectId $webhookSP.Id -RoleDefinitionName "Data Factory Contributor" -Scope $adfResourceId | Out-Null
+                Write-Host "✓ Data Factory Contributor role assigned to SP" -ForegroundColor Green
+                break
+            } catch {
+                $spRoleRetry++
+                if ($spRoleRetry -ge 5) { throw "Failed to assign SP role after 5 attempts: $_" }
+                Write-Host "  Retrying SP role assignment... ($spRoleRetry/5)" -ForegroundColor Yellow
+                Start-Sleep -Seconds 5
+            }
+        }
+    } else {
+        Write-Host "✓ Data Factory Contributor role already assigned to SP" -ForegroundColor Green
+    }
+
+    Write-Host "✓ Webhook SP configured" -ForegroundColor Green
+    Write-Host "  SP Name:    $webhookSPName" -ForegroundColor Gray
+    Write-Host "  Client ID:  $webhookClientId" -ForegroundColor Gray
+    Write-Host "  Tenant ID:  $webhookTenantId" -ForegroundColor Gray
+    Write-Host "  Trigger URI: $webhookTriggerUri" -ForegroundColor Gray
+
+    # =========================================================================
     # Summary
     # =========================================================================
     Write-Host "`n$("=" * 80)" -ForegroundColor Green
@@ -506,7 +672,19 @@ try {
         Write-Host "Integration Runtime:  $IRName (Managed VNet)" -ForegroundColor White
         Write-Host "Private Endpoint:     $ManagedPEName" -ForegroundColor White
     }
+    Write-Host "Webhook SP:           $webhookSPName" -ForegroundColor White
+    Write-Host "Webhook Tenant ID:    $webhookTenantId" -ForegroundColor White
+    Write-Host "Webhook Client ID:    $webhookClientId" -ForegroundColor White
+    Write-Host "Webhook Trigger URI:  $webhookTriggerUri" -ForegroundColor White
     Write-Host ("=" * 80) -ForegroundColor Green
+
+    # Webhook usage instructions
+    Write-Host "`nTo trigger the pipeline via webhook (PowerShell):" -ForegroundColor Yellow
+    Write-Host @"
+`$tokenBody = `"grant_type=client_credentials&client_id=$webhookClientId&client_secret=<SECRET>&resource=https://management.azure.com/"
+`$tokenResp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$webhookTenantId/oauth2/token" -Method Post -Body `$tokenBody
+Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorization = "Bearer `$(`$tokenResp.access_token)"} -ContentType "application/json" -Body '{"days": 7}'
+"@ -ForegroundColor Gray
 
     # Manual trigger instructions
     Write-Host "`nTo trigger the pipeline manually:" -ForegroundColor Yellow
@@ -536,6 +714,11 @@ Invoke-AzDataFactoryV2Pipeline ``
         IntegrationRuntime = if ($usePrivateEndpoint) { $IRName } else { "AutoResolveIntegrationRuntime" }
         PrivateEndpoint    = if ($usePrivateEndpoint) { $ManagedPEName } else { $null }
         ScheduleStartTime  = $ScheduleStartTime
+        WebhookSPName      = $webhookSPName
+        WebhookTenantId    = $webhookTenantId
+        WebhookClientId    = $webhookClientId
+        WebhookClientSecret = $webhookClientSecret
+        WebhookTriggerUri  = $webhookTriggerUri
     }
 
     $resultsJson = $results | ConvertTo-Json -Depth 5
@@ -549,14 +732,20 @@ Invoke-AzDataFactoryV2Pipeline ``
 
         $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
 
+        # Ensure both required containers exist
+        foreach ($requiredContainer in @('runbooks', 'logs')) {
+            $existingContainer = Get-AzStorageContainer -Name $requiredContainer -Context $destinationContext -ErrorAction SilentlyContinue
+            if (-not $existingContainer) {
+                Write-Host "Creating container: $requiredContainer" -ForegroundColor Yellow
+                New-AzStorageContainer -Name $requiredContainer -Context $destinationContext -Permission Off | Out-Null
+                Write-Host "✓ Container '$requiredContainer' created" -ForegroundColor Green
+            } else {
+                Write-Host "✓ Container '$requiredContainer' already exists" -ForegroundColor Green
+            }
+        }
+
         $tempJsonPath = Join-Path (Get-Location) $resultsFileName
         $resultsJson | Out-File -FilePath $tempJsonPath -Encoding utf8 -Force
-
-        $destinationContainer = Get-AzStorageContainer -Name $containerName -Context $destinationContext -ErrorAction SilentlyContinue
-        if (-not $destinationContainer) {
-            Write-Host "Creating destination container: $containerName" -ForegroundColor Yellow
-            New-AzStorageContainer -Name $containerName -Context $destinationContext -Permission Off | Out-Null
-        }
 
         Set-AzStorageBlobContent -File $tempJsonPath -Container $containerName -Blob $resultsFileName -Context $destinationContext -Force | Out-Null
         Write-Host "✓ Results uploaded: $resultsFileName to $customerStorageAccount/$containerName" -ForegroundColor Green
