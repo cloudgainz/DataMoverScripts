@@ -29,27 +29,72 @@ $exportStorageContainer = $parameterTable.exportStorageContainer
 $exportsDirectory = $parameterTable.exportsDirectory
 $customerStorageAccount = $parameterTable.customerStorageAccount
 $customerToken = $parameterTable.customerToken
-$days = if ($parameterTable.days) { [int]$parameterTable.days } else { 7 }
+
+# Folder names under exportsDirectory for the three data classes
+$dailiesFolder   = $parameterTable.dailiesFolder
+$monthliesFolder = $parameterTable.monthliesFolder
+$onetimeFolder   = $parameterTable.onetimeFolder
+
+# Scheduling — all run times are HH:mm, interpreted in $timeZone
+$timeZone            = if ($parameterTable.timeZone)            { $parameterTable.timeZone }            else { 'Eastern Standard Time' }
+$dailyRunTime        = if ($parameterTable.dailyRunTime)        { $parameterTable.dailyRunTime }        else { '02:00' }
+$catchupRunTime      = if ($parameterTable.catchupRunTime)      { $parameterTable.catchupRunTime }      else { '02:30' }
+$monthlyRunTime      = if ($parameterTable.monthlyRunTime)      { $parameterTable.monthlyRunTime }      else { '03:00' }
+$monthlyDayOfMonth   = if ($parameterTable.monthlyDayOfMonth)   { [int]$parameterTable.monthlyDayOfMonth }   else { 6 }
+$catchupCutoffDay    = if ($parameterTable.catchupCutoffDay)    { [int]$parameterTable.catchupCutoffDay }    else { 5 }
+$dailyLookbackDays   = if ($parameterTable.dailyLookbackDays)   { [int]$parameterTable.dailyLookbackDays }   else { 2 }
+$catchupLookbackDays = if ($parameterTable.catchupLookbackDays) { [int]$parameterTable.catchupLookbackDays } else { 7 }
+
+if ($catchupCutoffDay -lt 1 -or $catchupCutoffDay -gt 28) {
+    throw "parameterTable.catchupCutoffDay ($catchupCutoffDay) must be between 1 and 28"
+}
+
+# Validate required folder names
+foreach ($pair in @(
+    @{ Name = 'dailiesFolder';   Value = $dailiesFolder },
+    @{ Name = 'monthliesFolder'; Value = $monthliesFolder },
+    @{ Name = 'onetimeFolder';   Value = $onetimeFolder }
+)) {
+    if ([string]::IsNullOrWhiteSpace($pair.Value)) {
+        throw "parameterTable.$($pair.Name) is required"
+    }
+}
 
 Set-AzContext -Subscription $subscriptionName
 
 # Naming conventions
-[string]$DataFactoryName = $siteName + "-adf"
-[string]$PipelineName = $siteName + "-DataMoverPipeline"
-[string]$TriggerName = $siteName + "-DailyTrigger"
+[string]$DataFactoryName         = $siteName + "-adf"
+[string]$PipelineName            = $siteName + "-DataMoverPipeline"
+[string]$DailyTriggerName        = $siteName + "-DailyTrigger"
+[string]$CatchupTriggerName      = $siteName + "-CatchupTrigger"
+[string]$MonthlyTriggerName      = $siteName + "-MonthlyTrigger"
 [string]$SourceLinkedServiceName = "SourceStorage"
-[string]$DestLinkedServiceName = "DestStorage"
-[string]$SourceDatasetName = "SourceBlobs"
-[string]$DestDatasetName = "DestBlobs"
-[string]$IRName = $siteName + "-ManagedIR"
-[string]$ManagedPEName = $siteName + "-SourceStoragePE"
+[string]$DestLinkedServiceName   = "DestStorage"
+[string]$SourceDatasetName       = "SourceBlobs"
+[string]$DestDatasetName         = "DestBlobs"
+[string]$IRName                  = $siteName + "-ManagedIR"
+[string]$ManagedPEName           = $siteName + "-SourceStoragePE"
 [hashtable]$Tags = @{}
 
 $normalizedPath = $exportsDirectory.Trim('/')
 $destContainerName = $siteName.ToLower()
 $usePrivateEndpoint = -not [string]::IsNullOrWhiteSpace($vnetSubnetId)
 
-[DateTime]$ScheduleStartTime = (Get-Date).AddDays(1).Date.AddHours(2)
+# Trigger startTime — slightly in the past so the next scheduled occurrence fires
+[DateTime]$ScheduleStartTime = (Get-Date).AddMinutes(-5)
+
+# Parse HH:mm run-time strings into hour/minute pairs for trigger schedules
+function ConvertTo-RunTimeParts {
+    param([Parameter(Mandatory)] [string]$TimeString)
+    if ($TimeString -notmatch '^\d{1,2}:\d{2}$') {
+        throw "Invalid run time '$TimeString' — expected HH:mm (e.g. '02:00')"
+    }
+    $parts = $TimeString.Split(':')
+    return @{ Hour = [int]$parts[0]; Minute = [int]$parts[1] }
+}
+$dailyTime   = ConvertTo-RunTimeParts -TimeString $dailyRunTime
+$catchupTime = ConvertTo-RunTimeParts -TimeString $catchupRunTime
+$monthlyTime = ConvertTo-RunTimeParts -TimeString $monthlyRunTime
 
 # Webhook / remote-trigger variables (populated in Step 9)
 $webhookSPName      = $null
@@ -336,7 +381,8 @@ try {
     # =========================================================================
     Write-Host "`n[6] Creating Datasets" -ForegroundColor Cyan
 
-    # Source dataset — Binary format, preserves file structure as-is
+    # Source dataset — Binary, parameterized on sourceFolder + dateRange.
+    # Pipeline supplies these per run; full path = {normalizedPath}/{sourceFolder}/{dateRange}
     Write-Host "Creating source dataset: $SourceDatasetName..." -ForegroundColor Yellow
     $sourceDatasetDef = @{
         name       = $SourceDatasetName
@@ -346,11 +392,18 @@ try {
                 referenceName = $SourceLinkedServiceName
                 type          = "LinkedServiceReference"
             }
+            parameters = @{
+                sourceFolder = @{ type = "String" }
+                dateRange    = @{ type = "String" }
+            }
             typeProperties = @{
                 location = @{
-                    type       = "AzureBlobStorageLocation"
-                    container  = $exportStorageContainer
-                    folderPath = $normalizedPath
+                    type      = "AzureBlobStorageLocation"
+                    container = $exportStorageContainer
+                    folderPath = @{
+                        value = "@concat('$normalizedPath', '/', dataset().sourceFolder, '/', dataset().dateRange)"
+                        type  = "Expression"
+                    }
                 }
             }
         }
@@ -358,9 +411,9 @@ try {
     $tmpFile = New-TempAdfJson -Definition $sourceDatasetDef
     Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $SourceDatasetName -DefinitionFile $tmpFile -Force | Out-Null
     Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Source dataset created ($exportStorageContainer/$normalizedPath)" -ForegroundColor Green
+    Write-Host "✓ Source dataset created (parameterized: $exportStorageContainer/$normalizedPath/{sourceFolder}/{dateRange})" -ForegroundColor Green
 
-    # Destination dataset — Binary format, mirrors source folder structure
+    # Destination dataset — Binary, mirrors {sourceFolder}/{dateRange} on the customer side
     Write-Host "Creating destination dataset: $DestDatasetName..." -ForegroundColor Yellow
     $destDatasetDef = @{
         name       = $DestDatasetName
@@ -370,11 +423,18 @@ try {
                 referenceName = $DestLinkedServiceName
                 type          = "LinkedServiceReference"
             }
+            parameters = @{
+                sourceFolder = @{ type = "String" }
+                dateRange    = @{ type = "String" }
+            }
             typeProperties = @{
                 location = @{
-                    type       = "AzureBlobStorageLocation"
-                    container  = $destContainerName
-                    folderPath = $normalizedPath
+                    type      = "AzureBlobStorageLocation"
+                    container = $destContainerName
+                    folderPath = @{
+                        value = "@concat('$normalizedPath', '/', dataset().sourceFolder, '/', dataset().dateRange)"
+                        type  = "Expression"
+                    }
                 }
             }
         }
@@ -382,27 +442,36 @@ try {
     $tmpFile = New-TempAdfJson -Definition $destDatasetDef
     Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $DestDatasetName -DefinitionFile $tmpFile -Force | Out-Null
     Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Destination dataset created ($destContainerName/$normalizedPath)" -ForegroundColor Green
+    Write-Host "✓ Destination dataset created (parameterized: $destContainerName/$normalizedPath/{sourceFolder}/{dateRange})" -ForegroundColor Green
 
     # =========================================================================
     # Step 7: Create Pipeline
     # =========================================================================
     Write-Host "`n[7] Creating Pipeline: $PipelineName" -ForegroundColor Cyan
 
-    # The pipeline has a 'days' parameter (default 7).
-    # The Copy activity filters source blobs by LastModified >= (now - days).
-    # Binary copy with recursive=true preserves full folder hierarchy.
-    # After the copy, two Web activities write a run-summary JSON blob to
-    # customerStorageAccount/logs/{siteName}-{RunId}.json via the SAS token.
+    # Pipeline parameters (supplied by triggers / on-demand caller):
+    #   sourceFolderName  — subfolder of $normalizedPath to copy from (dailies/monthly/onetime)
+    #   monthOffset       — 0 = current month folder, -1 = previous month folder
+    #   lookbackDays      — LastModified filter window in days (0 = no filter, grab all)
+    #   mode              — label for log/audit (daily/catchup/monthly/onetime)
     #
-    # Body objects use ADF @{expression} interpolation inside string values —
-    # ADF substitutes each @{...} at runtime, so no concat() expressions needed.
-    # PowerShell serializes these hashtables to JSON via New-TempAdfJson.
-    $logBlobUrlExpr = "@concat('https://$customerStorageAccount.blob.core.windows.net/logs/$siteName-', pipeline().RunId, '.json?$customerToken')"
+    # Pipeline computes dateRange ('yyyyMMdd-yyyyMMdd') at run time from monthOffset
+    # in $timeZone, then copies {sourceFolderName}/{dateRange}/** to the same path
+    # on the customer side. Run summary written to logs/{siteName}-{mode}-{RunId}.json
+    $logBlobUrlExpr = "@concat('https://$customerStorageAccount.blob.core.windows.net/logs/$siteName-', pipeline().parameters.mode, '-', pipeline().RunId, '.json?$customerToken')"
+
+    # ADF expressions kept as PowerShell variables for readability
+    $targetDateExpr = "@if(equals(pipeline().parameters.monthOffset, 0), convertTimeZone(utcnow(), 'UTC', '$timeZone'), subtractFromTime(convertTimeZone(utcnow(), 'UTC', '$timeZone'), 1, 'Month'))"
+    $dateRangeExpr  = "@concat(formatDateTime(startOfMonth(variables('targetDate')), 'yyyyMMdd'), '-', formatDateTime(addDays(addToTime(startOfMonth(variables('targetDate')), 1, 'Month'), -1), 'yyyyMMdd'))"
+    $modifiedFilterExpr = "@if(greater(pipeline().parameters.lookbackDays, 0), formatDateTime(addDays(utcnow(), mul(pipeline().parameters.lookbackDays, -1)), 'yyyy-MM-ddTHH:mm:ssZ'), '1900-01-01T00:00:00Z')"
 
     $successBody = @{
         runId               = "@{pipeline().RunId}"
         pipeline            = "@{pipeline().Pipeline}"
+        mode                = "@{pipeline().parameters.mode}"
+        sourceFolder        = "@{pipeline().parameters.sourceFolderName}"
+        dateRange           = "@{variables('dateRange')}"
+        lookbackDays        = "@{pipeline().parameters.lookbackDays}"
         triggerTime         = "@{string(pipeline().TriggerTime)}"
         status              = "Succeeded"
         dataReadBytes       = "@{activity('CopyBlobs').output.dataRead}"
@@ -416,6 +485,9 @@ try {
     $failureBody = @{
         runId        = "@{pipeline().RunId}"
         pipeline     = "@{pipeline().Pipeline}"
+        mode         = "@{pipeline().parameters.mode}"
+        sourceFolder = "@{pipeline().parameters.sourceFolderName}"
+        dateRange    = "@{variables('dateRange')}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "Failed"
         errorCode    = "@{activity('CopyBlobs').error.errorCode}"
@@ -426,6 +498,7 @@ try {
     $logErrorBody = @{
         runId        = "@{pipeline().RunId}"
         pipeline     = "@{pipeline().Pipeline}"
+        mode         = "@{pipeline().parameters.mode}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "LoggingError"
         errorCode    = "@{activity('WriteSuccessLog').error.errorCode}"
@@ -437,35 +510,78 @@ try {
         name       = $PipelineName
         properties = @{
             parameters = @{
-                days = @{
-                    type         = "Int"
-                    defaultValue = $days
-                }
+                sourceFolderName = @{ type = "String" }
+                monthOffset      = @{ type = "Int";    defaultValue = 0 }
+                lookbackDays     = @{ type = "Int";    defaultValue = $dailyLookbackDays }
+                mode             = @{ type = "String"; defaultValue = "daily" }
+            }
+            variables = @{
+                targetDate = @{ type = "String" }
+                dateRange  = @{ type = "String" }
             }
             activities = @(
+                # ------------------------------------------------------------------
+                # SetTargetDate: compute timestamp for current or prior month
+                # ------------------------------------------------------------------
                 @{
-                    name    = "CopyBlobs"
-                    type    = "Copy"
+                    name = "SetTargetDate"
+                    type = "SetVariable"
+                    typeProperties = @{
+                        variableName = "targetDate"
+                        value        = @{ value = $targetDateExpr; type = "Expression" }
+                    }
+                },
+                # ------------------------------------------------------------------
+                # SetDateRange: format yyyyMMdd-yyyyMMdd for the target month
+                # ------------------------------------------------------------------
+                @{
+                    name      = "SetDateRange"
+                    type      = "SetVariable"
+                    dependsOn = @(
+                        @{ activity = "SetTargetDate"; dependencyConditions = @("Succeeded") }
+                    )
+                    typeProperties = @{
+                        variableName = "dateRange"
+                        value        = @{ value = $dateRangeExpr; type = "Expression" }
+                    }
+                },
+                # ------------------------------------------------------------------
+                # CopyBlobs: copy {sourceFolder}/{dateRange}/** to mirrored path
+                # ------------------------------------------------------------------
+                @{
+                    name      = "CopyBlobs"
+                    type      = "Copy"
+                    dependsOn = @(
+                        @{ activity = "SetDateRange"; dependencyConditions = @("Succeeded") }
+                    )
                     inputs  = @(
                         @{
                             referenceName = $SourceDatasetName
                             type          = "DatasetReference"
+                            parameters = @{
+                                sourceFolder = "@pipeline().parameters.sourceFolderName"
+                                dateRange    = "@variables('dateRange')"
+                            }
                         }
                     )
                     outputs = @(
                         @{
                             referenceName = $DestDatasetName
                             type          = "DatasetReference"
+                            parameters = @{
+                                sourceFolder = "@pipeline().parameters.sourceFolderName"
+                                dateRange    = "@variables('dateRange')"
+                            }
                         }
                     )
                     typeProperties = @{
                         source = @{
                             type          = "BinarySource"
                             storeSettings = @{
-                                type                      = "AzureBlobStorageReadSettings"
-                                recursive                 = $true
-                                modifiedDatetimeStart     = @{
-                                    value = "@adddays(utcnow(), sub(0, pipeline().parameters.days))"
+                                type                       = "AzureBlobStorageReadSettings"
+                                recursive                  = $true
+                                modifiedDatetimeStart      = @{
+                                    value = $modifiedFilterExpr
                                     type  = "Expression"
                                 }
                                 deleteFilesAfterCompletion = $false
@@ -542,55 +658,126 @@ try {
     $tmpFile = New-TempAdfJson -Definition $pipelineDef
     Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $PipelineName -DefinitionFile $tmpFile -Force | Out-Null
     Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Pipeline created (copies blobs modified in last $days days)" -ForegroundColor Green
+    Write-Host "✓ Pipeline created (mode-driven; copies {sourceFolderName}/{computed-dateRange}/**)" -ForegroundColor Green
 
     # =========================================================================
-    # Step 8: Create and Start Daily Trigger
+    # Step 8: Create and Start Triggers (Daily, Catchup, Monthly)
+    # On-demand "onetime" runs are webhook-only — no scheduled trigger.
     # =========================================================================
-    Write-Host "`n[8] Creating Trigger: $TriggerName" -ForegroundColor Cyan
+    Write-Host "`n[8] Creating Triggers" -ForegroundColor Cyan
 
-    # Stop existing trigger if it's running (required before update)
-    $existingTrigger = Get-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $TriggerName -ErrorAction SilentlyContinue
-    if ($existingTrigger -and $existingTrigger.RuntimeState -eq "Started") {
-        Write-Host "Stopping existing trigger before update..." -ForegroundColor Yellow
-        Stop-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $TriggerName -Force | Out-Null
-    }
-
-    $triggerDef = @{
-        name       = $TriggerName
-        properties = @{
-            type           = "ScheduleTrigger"
-            typeProperties = @{
-                recurrence = @{
-                    frequency = "Day"
-                    interval  = 1
-                    startTime = $ScheduleStartTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
-                    timeZone  = (Get-TimeZone).Id
-                }
-            }
-            pipelines = @(
-                @{
-                    pipelineReference = @{
-                        referenceName = $PipelineName
-                        type          = "PipelineReference"
-                    }
-                    parameters = @{
-                        days = $days
-                    }
-                }
-            )
+    function Stop-AdfTriggerIfRunning {
+        param([Parameter(Mandatory)] [string]$Name)
+        $existing = Get-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $Name -ErrorAction SilentlyContinue
+        if ($existing -and $existing.RuntimeState -eq "Started") {
+            Write-Host "  Stopping existing trigger '$Name'..." -ForegroundColor Yellow
+            Stop-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $Name -Force | Out-Null
         }
     }
-    $tmpFile = New-TempAdfJson -Definition $triggerDef
-    Set-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $TriggerName -DefinitionFile $tmpFile -Force | Out-Null
-    Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Trigger created" -ForegroundColor Green
 
-    # Start the trigger
-    Write-Host "Starting trigger..." -ForegroundColor Yellow
-    Start-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $TriggerName -Force | Out-Null
-    Write-Host "✓ Trigger started" -ForegroundColor Green
-    Write-Host "  Schedule: Daily at $($ScheduleStartTime.ToString('HH:mm')) ($((Get-TimeZone).Id))" -ForegroundColor Gray
+    function New-AdfTriggerDefinition {
+        param(
+            [Parameter(Mandatory)] [string]$Name,
+            [Parameter(Mandatory)] [hashtable]$Recurrence,
+            [Parameter(Mandatory)] [hashtable]$PipelineParameters
+        )
+        return @{
+            name       = $Name
+            properties = @{
+                type           = "ScheduleTrigger"
+                typeProperties = @{ recurrence = $Recurrence }
+                pipelines = @(
+                    @{
+                        pipelineReference = @{
+                            referenceName = $PipelineName
+                            type          = "PipelineReference"
+                        }
+                        parameters = $PipelineParameters
+                    }
+                )
+            }
+        }
+    }
+
+    function Set-AdfTrigger {
+        param(
+            [Parameter(Mandatory)] [string]$Name,
+            [Parameter(Mandatory)] [hashtable]$Definition
+        )
+        Stop-AdfTriggerIfRunning -Name $Name
+        $tmpFile = New-TempAdfJson -Definition $Definition
+        Set-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $Name -DefinitionFile $tmpFile -Force | Out-Null
+        Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+        Start-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $Name -Force | Out-Null
+        Write-Host "✓ Trigger '$Name' created + started" -ForegroundColor Green
+    }
+
+    $startTimeIso = $ScheduleStartTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    # ---- DailyTrigger: every day at $dailyRunTime $timeZone (current month dailies) ----
+    Write-Host "DailyTrigger — every day $dailyRunTime $timeZone (current month dailies, lookback $dailyLookbackDays d)" -ForegroundColor Yellow
+    $dailyRecurrence = @{
+        frequency = "Day"
+        interval  = 1
+        startTime = $startTimeIso
+        timeZone  = $timeZone
+        schedule  = @{
+            hours   = @($dailyTime.Hour)
+            minutes = @($dailyTime.Minute)
+        }
+    }
+    $dailyParams = @{
+        sourceFolderName = $dailiesFolder
+        monthOffset      = 0
+        lookbackDays     = $dailyLookbackDays
+        mode             = "daily"
+    }
+    Set-AdfTrigger -Name $DailyTriggerName -Definition (New-AdfTriggerDefinition -Name $DailyTriggerName -Recurrence $dailyRecurrence -PipelineParameters $dailyParams)
+
+    # ---- CatchupTrigger: days 1..catchupCutoffDay at $catchupRunTime $timeZone (prior month dailies) ----
+    $catchupDays = @(1..$catchupCutoffDay)
+    Write-Host "CatchupTrigger — days 1-$catchupCutoffDay at $catchupRunTime $timeZone (prior month dailies, lookback $catchupLookbackDays d)" -ForegroundColor Yellow
+    $catchupRecurrence = @{
+        frequency = "Month"
+        interval  = 1
+        startTime = $startTimeIso
+        timeZone  = $timeZone
+        schedule  = @{
+            monthDays = $catchupDays
+            hours     = @($catchupTime.Hour)
+            minutes   = @($catchupTime.Minute)
+        }
+    }
+    $catchupParams = @{
+        sourceFolderName = $dailiesFolder
+        monthOffset      = -1
+        lookbackDays     = $catchupLookbackDays
+        mode             = "catchup"
+    }
+    Set-AdfTrigger -Name $CatchupTriggerName -Definition (New-AdfTriggerDefinition -Name $CatchupTriggerName -Recurrence $catchupRecurrence -PipelineParameters $catchupParams)
+
+    # ---- MonthlyTrigger: day $monthlyDayOfMonth at $monthlyRunTime $timeZone (prior month monthlies) ----
+    Write-Host "MonthlyTrigger — day $monthlyDayOfMonth at $monthlyRunTime $timeZone (prior month monthlies, no lookback filter)" -ForegroundColor Yellow
+    $monthlyRecurrence = @{
+        frequency = "Month"
+        interval  = 1
+        startTime = $startTimeIso
+        timeZone  = $timeZone
+        schedule  = @{
+            monthDays = @($monthlyDayOfMonth)
+            hours     = @($monthlyTime.Hour)
+            minutes   = @($monthlyTime.Minute)
+        }
+    }
+    $monthlyParams = @{
+        sourceFolderName = $monthliesFolder
+        monthOffset      = -1
+        lookbackDays     = 0
+        mode             = "monthly"
+    }
+    Set-AdfTrigger -Name $MonthlyTriggerName -Definition (New-AdfTriggerDefinition -Name $MonthlyTriggerName -Recurrence $monthlyRecurrence -PipelineParameters $monthlyParams)
+
+    Write-Host "✓ Schedule triggers created. Onetime runs are invoked via webhook only." -ForegroundColor Green
 
     # =========================================================================
     # Step 9: Create Service Principal for remote / webhook pipeline triggering
@@ -664,10 +851,17 @@ try {
     Write-Host "Data Factory:         $DataFactoryName" -ForegroundColor White
     Write-Host "Location:             $location" -ForegroundColor White
     Write-Host "Source:               $exportStorageAccount/$exportStorageContainer/$normalizedPath" -ForegroundColor White
+    Write-Host "  Dailies folder:     $dailiesFolder" -ForegroundColor White
+    Write-Host "  Monthlies folder:   $monthliesFolder" -ForegroundColor White
+    Write-Host "  Onetime folder:     $onetimeFolder" -ForegroundColor White
     Write-Host "Destination:          $customerStorageAccount/$destContainerName/$normalizedPath" -ForegroundColor White
     Write-Host "Pipeline:             $PipelineName" -ForegroundColor White
-    Write-Host "Trigger:              $TriggerName (Daily at $($ScheduleStartTime.ToString('HH:mm')))" -ForegroundColor White
-    Write-Host "Days Filter:          $days" -ForegroundColor White
+    Write-Host "TimeZone:             $timeZone" -ForegroundColor White
+    Write-Host "Triggers:" -ForegroundColor White
+    Write-Host "  $DailyTriggerName    — daily $dailyRunTime (lookback $dailyLookbackDays d)" -ForegroundColor White
+    Write-Host "  $CatchupTriggerName  — days 1-$catchupCutoffDay at $catchupRunTime (lookback $catchupLookbackDays d)" -ForegroundColor White
+    Write-Host "  $MonthlyTriggerName  — day $monthlyDayOfMonth at $monthlyRunTime (no lookback filter)" -ForegroundColor White
+    Write-Host "  (onetime: webhook-only — no scheduled trigger)" -ForegroundColor White
     if ($usePrivateEndpoint) {
         Write-Host "Integration Runtime:  $IRName (Managed VNet)" -ForegroundColor White
         Write-Host "Private Endpoint:     $ManagedPEName" -ForegroundColor White
@@ -678,48 +872,65 @@ try {
     Write-Host "Webhook Trigger URI:  $webhookTriggerUri" -ForegroundColor White
     Write-Host ("=" * 80) -ForegroundColor Green
 
-    # Webhook usage instructions
-    Write-Host "`nTo trigger the pipeline via webhook (PowerShell):" -ForegroundColor Yellow
+    # Webhook usage instructions — onetime / on-demand
+    Write-Host "`nTo trigger an on-demand 'onetime' run via webhook (PowerShell):" -ForegroundColor Yellow
     Write-Host @"
 `$tokenBody = `"grant_type=client_credentials&client_id=$webhookClientId&client_secret=<SECRET>&resource=https://management.azure.com/"
 `$tokenResp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$webhookTenantId/oauth2/token" -Method Post -Body `$tokenBody
-Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorization = "Bearer `$(`$tokenResp.access_token)"} -ContentType "application/json" -Body '{"days": 7}'
+`$body = @{
+    sourceFolderName = '$onetimeFolder'
+    monthOffset      = 0       # 0 = current month folder, -1 = prior month
+    lookbackDays     = 0       # 0 = no LastModified filter (grab everything in folder)
+    mode             = 'onetime'
+} | ConvertTo-Json
+Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorization = "Bearer `$(`$tokenResp.access_token)"} -ContentType "application/json" -Body `$body
 "@ -ForegroundColor Gray
 
     # Manual trigger instructions
-    Write-Host "`nTo trigger the pipeline manually:" -ForegroundColor Yellow
+    Write-Host "`nTo trigger the pipeline manually (PowerShell):" -ForegroundColor Yellow
     Write-Host @"
 Invoke-AzDataFactoryV2Pipeline ``
     -ResourceGroupName "$ResourceGroupName" ``
     -DataFactoryName "$DataFactoryName" ``
     -PipelineName "$PipelineName" ``
-    -Parameter @{ days = $days }
+    -Parameter @{ sourceFolderName = '$onetimeFolder'; monthOffset = 0; lookbackDays = 0; mode = 'onetime' }
 "@ -ForegroundColor Gray
 
-    # Build results object
-    $results = [PSCustomObject]@{
-        Mode               = if ($usePrivateEndpoint) { "ManagedVNet" } else { "Standard" }
-        ResourceGroup      = $ResourceGroupName
-        DataFactory        = $DataFactoryName
-        Location           = $location
-        SourceStorage      = $exportStorageAccount
-        SourceContainer    = $exportStorageContainer
-        SourceFolder       = $normalizedPath
-        DestStorage        = $customerStorageAccount
-        DestContainer      = $destContainerName
-        DestFolder         = $normalizedPath
-        Pipeline           = $PipelineName
-        Trigger            = $TriggerName
-        DaysFilter         = $days
-        IntegrationRuntime = if ($usePrivateEndpoint) { $IRName } else { "AutoResolveIntegrationRuntime" }
-        PrivateEndpoint    = if ($usePrivateEndpoint) { $ManagedPEName } else { $null }
-        ScheduleStartTime  = $ScheduleStartTime
-        WebhookSPName      = $webhookSPName
-        WebhookTenantId    = $webhookTenantId
-        WebhookClientId    = $webhookClientId
-        WebhookClientSecret = $webhookClientSecret
-        WebhookTriggerUri  = $webhookTriggerUri
-    }
+    # Build results object (Add-Member style per project convention)
+    $results = New-Object psobject
+    $results | Add-Member -MemberType NoteProperty -Name Mode                -Value $(if ($usePrivateEndpoint) { "ManagedVNet" } else { "Standard" })
+    $results | Add-Member -MemberType NoteProperty -Name ResourceGroup       -Value $ResourceGroupName
+    $results | Add-Member -MemberType NoteProperty -Name DataFactory         -Value $DataFactoryName
+    $results | Add-Member -MemberType NoteProperty -Name Location            -Value $location
+    $results | Add-Member -MemberType NoteProperty -Name SourceStorage       -Value $exportStorageAccount
+    $results | Add-Member -MemberType NoteProperty -Name SourceContainer     -Value $exportStorageContainer
+    $results | Add-Member -MemberType NoteProperty -Name SourceFolder        -Value $normalizedPath
+    $results | Add-Member -MemberType NoteProperty -Name DailiesFolder       -Value $dailiesFolder
+    $results | Add-Member -MemberType NoteProperty -Name MonthliesFolder     -Value $monthliesFolder
+    $results | Add-Member -MemberType NoteProperty -Name OnetimeFolder       -Value $onetimeFolder
+    $results | Add-Member -MemberType NoteProperty -Name DestStorage         -Value $customerStorageAccount
+    $results | Add-Member -MemberType NoteProperty -Name DestContainer       -Value $destContainerName
+    $results | Add-Member -MemberType NoteProperty -Name DestFolder          -Value $normalizedPath
+    $results | Add-Member -MemberType NoteProperty -Name Pipeline            -Value $PipelineName
+    $results | Add-Member -MemberType NoteProperty -Name TimeZone            -Value $timeZone
+    $results | Add-Member -MemberType NoteProperty -Name DailyTrigger        -Value $DailyTriggerName
+    $results | Add-Member -MemberType NoteProperty -Name DailyRunTime        -Value $dailyRunTime
+    $results | Add-Member -MemberType NoteProperty -Name DailyLookbackDays   -Value $dailyLookbackDays
+    $results | Add-Member -MemberType NoteProperty -Name CatchupTrigger      -Value $CatchupTriggerName
+    $results | Add-Member -MemberType NoteProperty -Name CatchupRunTime      -Value $catchupRunTime
+    $results | Add-Member -MemberType NoteProperty -Name CatchupCutoffDay    -Value $catchupCutoffDay
+    $results | Add-Member -MemberType NoteProperty -Name CatchupLookbackDays -Value $catchupLookbackDays
+    $results | Add-Member -MemberType NoteProperty -Name MonthlyTrigger      -Value $MonthlyTriggerName
+    $results | Add-Member -MemberType NoteProperty -Name MonthlyDayOfMonth   -Value $monthlyDayOfMonth
+    $results | Add-Member -MemberType NoteProperty -Name MonthlyRunTime      -Value $monthlyRunTime
+    $results | Add-Member -MemberType NoteProperty -Name IntegrationRuntime  -Value $(if ($usePrivateEndpoint) { $IRName } else { "AutoResolveIntegrationRuntime" })
+    $results | Add-Member -MemberType NoteProperty -Name PrivateEndpoint     -Value $(if ($usePrivateEndpoint) { $ManagedPEName } else { $null })
+    $results | Add-Member -MemberType NoteProperty -Name ScheduleStartTime   -Value $ScheduleStartTime
+    $results | Add-Member -MemberType NoteProperty -Name WebhookSPName       -Value $webhookSPName
+    $results | Add-Member -MemberType NoteProperty -Name WebhookTenantId     -Value $webhookTenantId
+    $results | Add-Member -MemberType NoteProperty -Name WebhookClientId     -Value $webhookClientId
+    $results | Add-Member -MemberType NoteProperty -Name WebhookClientSecret -Value $webhookClientSecret
+    $results | Add-Member -MemberType NoteProperty -Name WebhookTriggerUri   -Value $webhookTriggerUri
 
     $resultsJson = $results | ConvertTo-Json -Depth 5
     Write-Host "`nReturn Object (JSON):" -ForegroundColor Yellow
