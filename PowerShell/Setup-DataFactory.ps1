@@ -139,10 +139,22 @@ if (-not $context) {
 Write-Host "Connected to Azure subscription: $($context.Subscription.Name)" -ForegroundColor Green
 $subscriptionId = $context.Subscription.Id
 
+# Resolve a writable temp dir cross-platform (Windows uses $env:TEMP, Linux/Cloud Shell uses /tmp).
+# Cloud Shell on Linux does not set $env:TEMP, so fall back to [IO.Path]::GetTempPath() and
+# create it if missing.
+$tempDir = [System.IO.Path]::GetTempPath()
+if ([string]::IsNullOrWhiteSpace($tempDir)) {
+    $tempDir = if ($IsWindows) { 'C:\Windows\Temp' } else { '/tmp' }
+}
+if (-not (Test-Path -LiteralPath $tempDir)) {
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+}
+Write-Host "Using temp dir: $tempDir" -ForegroundColor Gray
+
 # Helper: create a temp JSON file from a hashtable (for ADF cmdlet -DefinitionFile params)
 function New-TempAdfJson {
     param([hashtable]$Definition)
-    $tempFile = Join-Path $env:TEMP "adf_$(New-Guid).json"
+    $tempFile = Join-Path $tempDir "adf_$(New-Guid).json"
     $Definition | ConvertTo-Json -Depth 20 | Out-File -FilePath $tempFile -Encoding utf8 -Force
     return $tempFile
 }
