@@ -793,64 +793,124 @@ try {
 
     # =========================================================================
     # Step 9: Create Service Principal for remote / webhook pipeline triggering
+    #
+    # This SP is used ONLY to allow the customer portal to fire on-demand
+    # ("onetime") pipeline runs via the ADF createRun REST endpoint. The three
+    # scheduled triggers (Daily/Catchup/Monthly) work without it. If the
+    # operator does not have Microsoft Entra permissions to create app
+    # registrations, we degrade gracefully: log a warning, skip Step 9, and
+    # flag WebhookStatus='disabled' in the result payload so the customer
+    # portal knows to hide the "Run Now" button.
     # =========================================================================
     Write-Host "`n[9] Creating webhook Service Principal" -ForegroundColor Cyan
 
-    $webhookSPName   = "$DataFactoryName-trigger-sp"
-    $adfResourceId   = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$DataFactoryName"
+    $webhookSPName     = "$DataFactoryName-trigger-sp"
+    $adfResourceId     = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$DataFactoryName"
     $webhookTriggerUri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$DataFactoryName/pipelines/$PipelineName/createRun?api-version=2018-06-01"
+    $webhookTenantId   = (Get-AzContext).Tenant.Id
+    $webhookStatus         = 'disabled'
+    $webhookDisabledReason = $null
 
-    # Check for an existing app with this name
-    $existingApp = Get-AzADApplication -DisplayName $webhookSPName -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if (-not $existingApp) {
-        Write-Host "Creating app registration: $webhookSPName..." -ForegroundColor Yellow
-        $webhookApp = New-AzADApplication -DisplayName $webhookSPName
-    } else {
-        Write-Host "App registration already exists: $webhookSPName" -ForegroundColor Yellow
-        $webhookApp = $existingApp
-    }
-
-    # Ensure a Service Principal exists for the app
-    $webhookSP = Get-AzADServicePrincipal -ApplicationId $webhookApp.AppId -ErrorAction SilentlyContinue
-    if (-not $webhookSP) {
-        Write-Host "Creating service principal..." -ForegroundColor Yellow
-        $webhookSP = New-AzADServicePrincipal -ApplicationId $webhookApp.AppId
-        Start-Sleep -Seconds 10  # Allow SP to propagate
-    }
-
-    # Generate a new client secret (valid 2 years)
-    Write-Host "Generating client secret (2-year expiry)..." -ForegroundColor Yellow
-    $credResult      = New-AzADAppCredential -ApplicationId $webhookApp.AppId -EndDate (Get-Date).AddYears(2)
-    $webhookClientSecret = $credResult.SecretText
-    $webhookClientId     = $webhookApp.AppId
-    $webhookTenantId     = (Get-AzContext).Tenant.Id
-
-    # Assign Data Factory Contributor on this ADF so the SP can trigger pipeline runs
-    $existingSpRole = Get-AzRoleAssignment -ObjectId $webhookSP.Id -RoleDefinitionName "Data Factory Contributor" -Scope $adfResourceId -ErrorAction SilentlyContinue
-    if (-not $existingSpRole) {
-        $spRoleRetry = 0
-        while ($spRoleRetry -lt 5) {
-            try {
-                New-AzRoleAssignment -ObjectId $webhookSP.Id -RoleDefinitionName "Data Factory Contributor" -Scope $adfResourceId | Out-Null
-                Write-Host "✓ Data Factory Contributor role assigned to SP" -ForegroundColor Green
-                break
-            } catch {
-                $spRoleRetry++
-                if ($spRoleRetry -ge 5) { throw "Failed to assign SP role after 5 attempts: $_" }
-                Write-Host "  Retrying SP role assignment... ($spRoleRetry/5)" -ForegroundColor Yellow
-                Start-Sleep -Seconds 5
+    # Probe: does the caller have directory permission to create app registrations?
+    # Anyone can create app regs if the tenant's `allowedToCreateApps` is true.
+    # Otherwise, the caller needs Application Developer / Application Administrator
+    # / Cloud Application Administrator / Global Administrator.
+    $canCreateApps = $false
+    try {
+        $authPolicyResp = Invoke-AzRestMethod -Method GET -Uri 'https://graph.microsoft.com/v1.0/policies/authorizationPolicy' -ErrorAction Stop
+        if ($authPolicyResp.StatusCode -ge 200 -and $authPolicyResp.StatusCode -lt 300) {
+            $authPolicy = $authPolicyResp.Content | ConvertFrom-Json
+            if ($authPolicy.defaultUserRolePermissions.allowedToCreateApps) {
+                $canCreateApps = $true
+                Write-Host "  Tenant policy allows app-reg creation for all users." -ForegroundColor Gray
+            } else {
+                # Fall back to directory-role check
+                $me = (Invoke-AzRestMethod -Method GET -Uri 'https://graph.microsoft.com/v1.0/me' -ErrorAction Stop).Content | ConvertFrom-Json
+                $memberOfResp = Invoke-AzRestMethod -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$($me.id)/memberOf" -ErrorAction Stop
+                $roles = ($memberOfResp.Content | ConvertFrom-Json).value |
+                    Where-Object { $_.'@odata.type' -eq '#microsoft.graph.directoryRole' } |
+                    Select-Object -ExpandProperty displayName
+                $eligibleRoles = @('Application Developer','Application Administrator','Cloud Application Administrator','Global Administrator')
+                $matchedRoles  = $roles | Where-Object { $eligibleRoles -contains $_ }
+                if ($matchedRoles) {
+                    $canCreateApps = $true
+                    Write-Host "  Caller holds eligible directory role: $($matchedRoles -join ', ')" -ForegroundColor Gray
+                }
             }
         }
-    } else {
-        Write-Host "✓ Data Factory Contributor role already assigned to SP" -ForegroundColor Green
+    } catch {
+        Write-Host "  ⚠ Could not probe directory permissions: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
-    Write-Host "✓ Webhook SP configured" -ForegroundColor Green
-    Write-Host "  SP Name:    $webhookSPName" -ForegroundColor Gray
-    Write-Host "  Client ID:  $webhookClientId" -ForegroundColor Gray
-    Write-Host "  Tenant ID:  $webhookTenantId" -ForegroundColor Gray
-    Write-Host "  Trigger URI: $webhookTriggerUri" -ForegroundColor Gray
+    if (-not $canCreateApps) {
+        $webhookDisabledReason = "Operator lacks Microsoft Entra ID permission to create app registrations in tenant '$webhookTenantId'. Tenant-wide 'Users can register applications' is disabled and the caller does not hold Application Developer / Application Administrator / Cloud Application Administrator / Global Administrator. Scheduled triggers (Daily/Catchup/Monthly) will still run normally. On-demand 'onetime' runs from the customer portal will be unavailable until a directory-privileged operator re-runs this deploy, or an SP is provisioned manually."
+        Write-Host "⚠ Skipping webhook SP creation — insufficient directory privileges." -ForegroundColor Yellow
+        Write-Host "  Reason: $webhookDisabledReason" -ForegroundColor Yellow
+        Write-Host "  Scheduled triggers still work; only on-demand runs are disabled." -ForegroundColor Yellow
+        $webhookClientId     = $null
+        $webhookClientSecret = $null
+    } else {
+        try {
+            # Check for an existing app with this name
+            $existingApp = Get-AzADApplication -DisplayName $webhookSPName -ErrorAction SilentlyContinue | Select-Object -First 1
+
+            if (-not $existingApp) {
+                Write-Host "Creating app registration: $webhookSPName..." -ForegroundColor Yellow
+                $webhookApp = New-AzADApplication -DisplayName $webhookSPName -ErrorAction Stop
+            } else {
+                Write-Host "App registration already exists: $webhookSPName" -ForegroundColor Yellow
+                $webhookApp = $existingApp
+            }
+
+            # Ensure a Service Principal exists for the app
+            $webhookSP = Get-AzADServicePrincipal -ApplicationId $webhookApp.AppId -ErrorAction SilentlyContinue
+            if (-not $webhookSP) {
+                Write-Host "Creating service principal..." -ForegroundColor Yellow
+                $webhookSP = New-AzADServicePrincipal -ApplicationId $webhookApp.AppId -ErrorAction Stop
+                Start-Sleep -Seconds 10  # Allow SP to propagate
+            }
+
+            # Generate a new client secret (valid 2 years)
+            Write-Host "Generating client secret (2-year expiry)..." -ForegroundColor Yellow
+            $credResult          = New-AzADAppCredential -ApplicationId $webhookApp.AppId -EndDate (Get-Date).AddYears(2) -ErrorAction Stop
+            $webhookClientSecret = $credResult.SecretText
+            $webhookClientId     = $webhookApp.AppId
+
+            # Assign Data Factory Contributor on this ADF so the SP can trigger pipeline runs
+            $existingSpRole = Get-AzRoleAssignment -ObjectId $webhookSP.Id -RoleDefinitionName "Data Factory Contributor" -Scope $adfResourceId -ErrorAction SilentlyContinue
+            if (-not $existingSpRole) {
+                $spRoleRetry = 0
+                while ($spRoleRetry -lt 5) {
+                    try {
+                        New-AzRoleAssignment -ObjectId $webhookSP.Id -RoleDefinitionName "Data Factory Contributor" -Scope $adfResourceId | Out-Null
+                        Write-Host "✓ Data Factory Contributor role assigned to SP" -ForegroundColor Green
+                        break
+                    } catch {
+                        $spRoleRetry++
+                        if ($spRoleRetry -ge 5) { throw "Failed to assign SP role after 5 attempts: $_" }
+                        Write-Host "  Retrying SP role assignment... ($spRoleRetry/5)" -ForegroundColor Yellow
+                        Start-Sleep -Seconds 5
+                    }
+                }
+            } else {
+                Write-Host "✓ Data Factory Contributor role already assigned to SP" -ForegroundColor Green
+            }
+
+            $webhookStatus = 'ready'
+            Write-Host "✓ Webhook SP configured" -ForegroundColor Green
+            Write-Host "  SP Name:    $webhookSPName" -ForegroundColor Gray
+            Write-Host "  Client ID:  $webhookClientId" -ForegroundColor Gray
+            Write-Host "  Tenant ID:  $webhookTenantId" -ForegroundColor Gray
+            Write-Host "  Trigger URI: $webhookTriggerUri" -ForegroundColor Gray
+        } catch {
+            # Probe said yes, but creation still failed — fall back gracefully
+            $webhookDisabledReason = "Probe indicated sufficient privileges, but app-registration creation failed at runtime: $($_.Exception.Message). Scheduled triggers still work; on-demand runs disabled."
+            Write-Host "⚠ Webhook SP creation failed mid-flight. $webhookDisabledReason" -ForegroundColor Yellow
+            $webhookClientId     = $null
+            $webhookClientSecret = $null
+            $webhookStatus       = 'disabled'
+        }
+    }
 
     # =========================================================================
     # Summary
@@ -878,13 +938,23 @@ try {
         Write-Host "Integration Runtime:  $IRName (Managed VNet)" -ForegroundColor White
         Write-Host "Private Endpoint:     $ManagedPEName" -ForegroundColor White
     }
-    Write-Host "Webhook SP:           $webhookSPName" -ForegroundColor White
-    Write-Host "Webhook Tenant ID:    $webhookTenantId" -ForegroundColor White
-    Write-Host "Webhook Client ID:    $webhookClientId" -ForegroundColor White
-    Write-Host "Webhook Trigger URI:  $webhookTriggerUri" -ForegroundColor White
+    Write-Host "Webhook Status:       $webhookStatus" -ForegroundColor $(if ($webhookStatus -eq 'ready') { 'White' } else { 'Yellow' })
+    if ($webhookStatus -eq 'ready') {
+        Write-Host "Webhook SP:           $webhookSPName" -ForegroundColor White
+        Write-Host "Webhook Tenant ID:    $webhookTenantId" -ForegroundColor White
+        Write-Host "Webhook Client ID:    $webhookClientId" -ForegroundColor White
+        Write-Host "Webhook Trigger URI:  $webhookTriggerUri" -ForegroundColor White
+    } else {
+        Write-Host "Webhook Disabled:     $webhookDisabledReason" -ForegroundColor Yellow
+        Write-Host "  On-demand 'onetime' runs from the customer portal will be unavailable." -ForegroundColor Yellow
+        Write-Host "  Scheduled runs (Daily/Catchup/Monthly) are unaffected." -ForegroundColor Yellow
+    }
     Write-Host ("=" * 80) -ForegroundColor Green
 
     # Webhook usage instructions — onetime / on-demand
+    if ($webhookStatus -ne 'ready') {
+        Write-Host "`nOn-demand webhook is NOT available for this site (see Webhook Disabled reason above)." -ForegroundColor Yellow
+    }
     Write-Host "`nTo trigger an on-demand 'onetime' run via webhook (PowerShell):" -ForegroundColor Yellow
     Write-Host @"
 `$tokenBody = `"grant_type=client_credentials&client_id=$webhookClientId&client_secret=<SECRET>&resource=https://management.azure.com/"
@@ -938,11 +1008,13 @@ Invoke-AzDataFactoryV2Pipeline ``
     $results | Add-Member -MemberType NoteProperty -Name IntegrationRuntime  -Value $(if ($usePrivateEndpoint) { $IRName } else { "AutoResolveIntegrationRuntime" })
     $results | Add-Member -MemberType NoteProperty -Name PrivateEndpoint     -Value $(if ($usePrivateEndpoint) { $ManagedPEName } else { $null })
     $results | Add-Member -MemberType NoteProperty -Name ScheduleStartTime   -Value $ScheduleStartTime
-    $results | Add-Member -MemberType NoteProperty -Name WebhookSPName       -Value $webhookSPName
-    $results | Add-Member -MemberType NoteProperty -Name WebhookTenantId     -Value $webhookTenantId
-    $results | Add-Member -MemberType NoteProperty -Name WebhookClientId     -Value $webhookClientId
-    $results | Add-Member -MemberType NoteProperty -Name WebhookClientSecret -Value $webhookClientSecret
-    $results | Add-Member -MemberType NoteProperty -Name WebhookTriggerUri   -Value $webhookTriggerUri
+    $results | Add-Member -MemberType NoteProperty -Name WebhookStatus         -Value $webhookStatus
+    $results | Add-Member -MemberType NoteProperty -Name WebhookDisabledReason -Value $webhookDisabledReason
+    $results | Add-Member -MemberType NoteProperty -Name WebhookSPName         -Value $(if ($webhookStatus -eq 'ready') { $webhookSPName } else { $null })
+    $results | Add-Member -MemberType NoteProperty -Name WebhookTenantId       -Value $(if ($webhookStatus -eq 'ready') { $webhookTenantId } else { $null })
+    $results | Add-Member -MemberType NoteProperty -Name WebhookClientId       -Value $webhookClientId
+    $results | Add-Member -MemberType NoteProperty -Name WebhookClientSecret   -Value $webhookClientSecret
+    $results | Add-Member -MemberType NoteProperty -Name WebhookTriggerUri     -Value $(if ($webhookStatus -eq 'ready') { $webhookTriggerUri } else { $null })
 
     $resultsJson = $results | ConvertTo-Json -Depth 5
     Write-Host "`nReturn Object (JSON):" -ForegroundColor Yellow
