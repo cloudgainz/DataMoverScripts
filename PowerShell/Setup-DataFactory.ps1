@@ -592,6 +592,7 @@ try {
                             storeSettings = @{
                                 type                       = "AzureBlobStorageReadSettings"
                                 recursive                  = $true
+                                wildcardFileName           = "*"
                                 modifiedDatetimeStart      = @{
                                     value = $modifiedFilterExpr
                                     type  = "Expression"
