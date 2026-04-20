@@ -6,7 +6,8 @@ param(
 $location = $parameterTable.location
 $siteName = $parameterTable.siteName
 $ResourceGroupName = $parameterTable.runBookRG
-$subscriptionName = $parameterTable.subscriptionName 
+$subscriptionName = $parameterTable.subscriptionName
+$vnetSubnetId = $parameterTable.vnetSubnetId  # optional - triggers Hybrid Worker mode if present
 
 Set-AzContext -Subscription $subscriptionName
 
@@ -23,12 +24,30 @@ Set-AzContext -Subscription $subscriptionName
 [int]$WebhookExpiryYears = 1
 [hashtable]$Tags = @{}
 
+# Hybrid Worker VM naming
+[string]$VMName = $siteName + "-hw-vm"
+[string]$NICName = $siteName + "-hw-nic"
+[string]$WorkerGroupName = $siteName + "-HybridWorkerGroup"
+[string]$VMSize = "Standard_B2s"
+[string]$VMAdminUser = "hwadmin"
+
+$useHybridWorker = -not [string]::IsNullOrWhiteSpace($vnetSubnetId)
+
+if ($useHybridWorker) {
+    Write-Host "Mode: Hybrid Worker (Linux) - Subnet: $vnetSubnetId" -ForegroundColor Magenta
+} else {
+    Write-Host "Mode: Cloud Automation Account" -ForegroundColor Magenta
+}
+
 # Set error action preference
 $ErrorActionPreference = "Stop"
 
 # Import required modules
 Write-Host "Checking for required Azure modules..." -ForegroundColor Cyan
 $requiredModules = @("Az.Accounts", "Az.Automation", "Az.Resources")
+if ($useHybridWorker) {
+    $requiredModules += @("Az.Compute", "Az.Network")
+}
 
 foreach ($module in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $module)) {
@@ -55,7 +74,7 @@ if (-not $WebhookName) {
 
 try {
     # Step 1: Create or verify Resource Group
-    Write-Host "`n[1/6] Checking Resource Group: $ResourceGroupName" -ForegroundColor Cyan
+    Write-Host "`n[1] Checking Resource Group: $ResourceGroupName" -ForegroundColor Cyan
     $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
     if (-not $rg) {
         Write-Host "Creating Resource Group: $ResourceGroupName in $Location" -ForegroundColor Yellow
@@ -66,11 +85,11 @@ try {
     }
 
     # Step 2: Create Automation Account
-    Write-Host "`n[2/6] Creating Azure Automation Account: $AutomationAccountName" -ForegroundColor Cyan
+    Write-Host "`n[2] Creating Azure Automation Account: $AutomationAccountName" -ForegroundColor Cyan
     $automationAccount = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
-    
+
     if (-not $automationAccount) {
-        $automationAccount = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -Plan Basic -Tags $Tags # -- Trap this in case of failure and provide a helpful error message -- wait for account
+        $automationAccount = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -Plan Basic -Tags $Tags
 
         Start-Sleep -Seconds 10 # Wait for the account to be fully provisioned before proceeding
 
@@ -80,7 +99,7 @@ try {
             Start-Sleep -Seconds 5
             $aatest = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
         }
-        
+
         Write-Host "✓ Automation Account created successfully" -ForegroundColor Green
         Write-Host "  Account ID: $($automationAccount.Identity.PrincipalId)" -ForegroundColor Gray
     } else {
@@ -88,137 +107,53 @@ try {
     }
 
     # Step 3: Configure Managed Identity and Storage Permissions
-    Write-Host "`n[3/8] Configuring Managed Identity and Storage Permissions" -ForegroundColor Cyan
-    
+    Write-Host "`n[3] Configuring Managed Identity and Storage Permissions" -ForegroundColor Cyan
+
     # Enable system-assigned managed identity
     Write-Host "Enabling system-assigned managed identity..." -ForegroundColor Yellow
     $identity = Set-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -AssignSystemIdentity
-    
+
     $principalId = $identity.Identity.PrincipalId
     Write-Host "✓ Managed identity enabled" -ForegroundColor Green
     Write-Host "  Principal ID: $principalId" -ForegroundColor Gray
-    
-    # Get the export storage account
-    # $exportStorageAccount = $parameterTable.exportStorageAccount
-    # Write-Host "Granting Storage Blob Data Reader role to $exportStorageAccount..." -ForegroundColor Yellow
-    
-    # $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount }
-    # if (-not $storageAccount) {
-    #     Write-Host "⚠ Warning: Export storage account '$exportStorageAccount' not found in current subscription" -ForegroundColor Yellow
-    #     Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
-    # } else {
-    #     # Assign Storage Blob Data Reader role
-    #     $roleAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
-        
-    #     if (-not $roleAssignment) {
-    #         $tryTotal = 5
-    #         $tryCount = 0 
-    #         while ($tryCount -lt $tryTotal) {
-    #             try {
-    #                 New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id | Out-Null
-    #                 Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
-    #                 break
-    #             } catch {
-    #                 $tryCount++
-    #                 if ($tryCount -ge $tryTotal) {
-    #                     throw "Failed to assign Storage Blob Data Reader role after $tryTotal attempts: $_"
-    #                 }
-    #                 Write-Host "Failed to assign role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
-    #                 Start-Sleep -Seconds 5
-    #             }
-    #         }
-            
-    #         Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
-    #     } else {
-    #         Write-Host "✓ Storage Blob Data Reader role already assigned" -ForegroundColor Green
-    #     }
-    # }
 
-        # Get the export storage account
     $exportStorageAccount = $parameterTable.exportStorageAccount
     Write-Host "Granting required roles to $exportStorageAccount..." -ForegroundColor Yellow
-    
+
     $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $exportStorageAccount }
     if (-not $storageAccount) {
         Write-Host "⚠ Warning: Export storage account '$exportStorageAccount' not found in current subscription" -ForegroundColor Yellow
         Write-Host "  You may need to manually grant permissions if the storage account is in a different subscription" -ForegroundColor Yellow
     } else {
-        # Assign Reader role
-        $readerAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
-        if (-not $readerAssignment) {
-            $tryTotal = 5
-            $tryCount = 0 
-            while ($tryCount -lt $tryTotal) {
-                try {
-                    New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Reader" -Scope $storageAccount.Id | Out-Null
-                    Write-Host "✓ Reader role assigned" -ForegroundColor Green
-                    break
-                } catch {
-                    $tryCount++
-                    if ($tryCount -ge $tryTotal) {
-                        throw "Failed to assign Reader role after $tryTotal attempts: $_"
+        $rolesToAssign = @("Reader", "Storage Blob Data Reader", "Storage Account Contributor")
+        foreach ($roleName in $rolesToAssign) {
+            $existingAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName $roleName -Scope $storageAccount.Id -ErrorAction SilentlyContinue
+            if (-not $existingAssignment) {
+                $tryTotal = 5
+                $tryCount = 0
+                while ($tryCount -lt $tryTotal) {
+                    try {
+                        New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName $roleName -Scope $storageAccount.Id | Out-Null
+                        Write-Host "✓ $roleName role assigned" -ForegroundColor Green
+                        break
+                    } catch {
+                        $tryCount++
+                        if ($tryCount -ge $tryTotal) {
+                            throw "Failed to assign $roleName role after $tryTotal attempts: $_"
+                        }
+                        Write-Host "Failed to assign $roleName role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
+                        Start-Sleep -Seconds 5
                     }
-                    Write-Host "Failed to assign Reader role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
-                    Start-Sleep -Seconds 5
                 }
+            } else {
+                Write-Host "✓ $roleName role already assigned" -ForegroundColor Green
             }
-        } else {
-            Write-Host "✓ Reader role already assigned" -ForegroundColor Green
-        }
-
-        # Assign Storage Blob Data Reader role
-        $blobReaderAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
-        
-        if (-not $blobReaderAssignment) {
-            $tryTotal = 5
-            $tryCount = 0 
-            while ($tryCount -lt $tryTotal) {
-                try {
-                    New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $storageAccount.Id | Out-Null
-                    Write-Host "✓ Storage Blob Data Reader role assigned" -ForegroundColor Green
-                    break
-                } catch {
-                    $tryCount++
-                    if ($tryCount -ge $tryTotal) {
-                        throw "Failed to assign Storage Blob Data Reader role after $tryTotal attempts: $_"
-                    }
-                    Write-Host "Failed to assign Storage Blob Data Reader role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
-                    Start-Sleep -Seconds 5
-                }
-            }
-        } else {
-            Write-Host "✓ Storage Blob Data Reader role already assigned" -ForegroundColor Green
-        }
-
-        # Assign Storage Account Contributor role
-        $contributorAssignment = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Account Contributor" -Scope $storageAccount.Id -ErrorAction SilentlyContinue
-        
-        if (-not $contributorAssignment) {
-            $tryTotal = 5
-            $tryCount = 0 
-            while ($tryCount -lt $tryTotal) {
-                try {
-                    New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "Storage Account Contributor" -Scope $storageAccount.Id | Out-Null
-                    Write-Host "✓ Storage Account Contributor role assigned" -ForegroundColor Green
-                    break
-                } catch {
-                    $tryCount++
-                    if ($tryCount -ge $tryTotal) {
-                        throw "Failed to assign Storage Account Contributor role after $tryTotal attempts: $_"
-                    }
-                    Write-Host "Failed to assign Storage Account Contributor role, retrying in 5 seconds... (Attempt $tryCount of $tryTotal)" -ForegroundColor Yellow
-                    Start-Sleep -Seconds 5
-                }
-            }
-        } else {
-            Write-Host "✓ Storage Account Contributor role already assigned" -ForegroundColor Green
         }
     }
 
-
     # Step 4: Download and import the runbook
-    Write-Host "`n[4/8] Importing Runbook: $RunbookName from $RunbookScriptUri" -ForegroundColor Cyan
-    
+    Write-Host "`n[4] Importing Runbook: $RunbookName from $RunbookScriptUri" -ForegroundColor Cyan
+
     # Download the script to a temporary location
     Write-Host "Downloading script from URI..." -ForegroundColor Yellow
 
@@ -226,7 +161,7 @@ try {
 
     try {
         Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
-        Invoke-RestMethod -Uri $RunbookScriptUri -OutFile $tempPath -UseBasicParsing 
+        Invoke-RestMethod -Uri $RunbookScriptUri -OutFile $tempPath -UseBasicParsing
         Write-Host "✓ Script downloaded successfully" -ForegroundColor Green
     } catch {
         throw "Failed to download script from URI: $_"
@@ -235,11 +170,6 @@ try {
     # Modify the script to inject the automation variable retrieval
     Write-Host "Injecting automation variable reference..." -ForegroundColor Yellow
     $scriptContent = Get-Content -Path $tempPath -Raw
-    # $variableName = "$siteName-ParameterTable"
-    # $variableRetrieval = "[hashtable]`$parameterTable = Get-AutomationVariable -Name '$variableName' | ConvertFrom-Json -AsHashtable"
-    
-    # Replace the entire line with SITENAME-ParameterTable placeholder
-    # $scriptContent = $scriptContent -replace '(?m)^\[hashtable\]\s*\$parameterTable\s*=\s*Get-AutomationVariable\s+-Name\s+.SITENAME-ParameterTable.\s*\|.*$', $variableRetrieval
     Start-Sleep -Seconds 5
     $siteNameTable = "$siteName-ParameterTable"
     $scriptContent = $scriptContent.replace("XXSITETABLEXX",$siteNameTable)
@@ -255,17 +185,17 @@ try {
     # Publish the runbook
     Write-Host "Publishing runbook..." -ForegroundColor Yellow
     Publish-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $RunbookName
-    
+
     Write-Host "✓ Runbook published successfully" -ForegroundColor Green
 
     # Clean up temp file
     Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
 
     # Step 5: Create Automation Variable for parameterTable
-    Write-Host "`n[5/8] Creating Automation Variable for parameterTable" -ForegroundColor Cyan
-    
+    Write-Host "`n[5] Creating Automation Variable for parameterTable" -ForegroundColor Cyan
+
     $variableName = "$siteName-ParameterTable"
-    
+
     # Check if variable exists and remove it
     $existingVariable = Get-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $variableName -ErrorAction SilentlyContinue
 
@@ -276,15 +206,198 @@ try {
 
     # Convert hashtable to JSON for storage
     $parameterTableJson = $parameterTable | ConvertTo-Json -Depth 10 -Compress
-    
+
     New-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $variableName -Value $parameterTableJson -Encrypted $false
 
     Write-Host "✓ Automation Variable created successfully" -ForegroundColor Green
     Write-Host "  Variable Name: $variableName" -ForegroundColor Gray
 
-    # Step 6: Create Schedule
-    Write-Host "`n[6/8] Creating Schedule: $ScheduleName" -ForegroundColor Cyan
-    
+    # -------------------------------------------------------------------------
+    # Step 6 (Hybrid Worker only): Create VM, NIC, Worker Group, and Extension
+    # -------------------------------------------------------------------------
+    $sshPrivateKeyPath = $null
+    if ($useHybridWorker) {
+        Write-Host "`n[6] Setting up Hybrid Worker (vnetSubnetId present)" -ForegroundColor Cyan
+
+        # Generate SSH key pair
+        Write-Host "Generating SSH key pair..." -ForegroundColor Yellow
+        $sshKeyName = "$siteName-hw-key"
+        $sshPrivateKeyPath = Join-Path $env:USERPROFILE ".ssh" "$sshKeyName"
+        $sshDir = Split-Path $sshPrivateKeyPath
+
+        if (-not (Test-Path $sshDir)) {
+            New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+        }
+
+        # Generate key using ssh-keygen
+        $tempKeyPath = Join-Path $env:TEMP $sshKeyName
+        ssh-keygen -t rsa -b 4096 -f $tempKeyPath -N "" -C "hwadmin@$siteName" -q
+
+        # Read keys
+        $sshPublicKey = Get-Content "$tempKeyPath.pub"
+        $sshPrivateKeyContent = Get-Content $tempKeyPath -Raw
+
+        # Save private key with restricted permissions
+        Set-Content -Path $sshPrivateKeyPath -Value $sshPrivateKeyContent -Force
+        (Get-Item $sshPrivateKeyPath).Attributes = "Hidden"
+
+        # Clean up temp files
+        Remove-Item $tempKeyPath -Force
+        Remove-Item "$tempKeyPath.pub" -Force
+
+        Write-Host "✓ SSH key pair generated" -ForegroundColor Green
+        Write-Host "  Private key saved to: $sshPrivateKeyPath" -ForegroundColor Gray
+
+        # Create dummy credential for VM config (username only)
+        $securePassword = ConvertTo-SecureString "dummy" -AsPlainText -Force
+        $vmCredential = New-Object System.Management.Automation.PSCredential($VMAdminUser, $securePassword)
+
+        # Create NIC in the specified subnet
+        Write-Host "Creating Network Interface in subnet..." -ForegroundColor Yellow
+        $existingNic = Get-AzNetworkInterface -Name $NICName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+        if (-not $existingNic) {
+            $nic = New-AzNetworkInterface -Name $NICName -ResourceGroupName $ResourceGroupName -Location $Location -SubnetId $vnetSubnetId -Tag $Tags
+            Write-Host "✓ NIC created: $NICName (Private IP: $($nic.IpConfigurations[0].PrivateIpAddress))" -ForegroundColor Green
+        } else {
+            $nic = $existingNic
+            Write-Host "✓ NIC already exists: $NICName (Private IP: $($nic.IpConfigurations[0].PrivateIpAddress))" -ForegroundColor Green
+        }
+
+        # Create VM (Windows or Linux)
+        $osDisplay = if ($HybridWorkerOS -eq "Windows") { "Windows Server 2025" } else { "Ubuntu 22.04 LTS" }
+        Write-Host "Creating Hybrid Worker VM: $VMName ($VMSize, $osDisplay)..." -ForegroundColor Yellow
+        $existingVM = Get-AzVM -Name $VMName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+        if (-not $existingVM) {
+            # Create Ubuntu 22.04 VM
+            $vmConfig = New-AzVMConfig -VMName $VMName -VMSize $VMSize -Tags $Tags |
+                Set-AzVMOperatingSystem -Linux -ComputerName ($siteName -replace '_','-') -Credential $vmCredential -DisablePasswordAuthentication |
+                Add-AzVMSshPublicKey -KeyData $sshPublicKey -Path "/home/$VMAdminUser/.ssh/authorized_keys" |
+                Set-AzVMSourceImage -PublisherName "Canonical" -Offer "0001-com-ubuntu-server-jammy" -Skus "22_04-lts-gen2" -Version "latest" |
+                Add-AzVMNetworkInterface -Id $nic.Id |
+                Set-AzVMBootDiagnostic -Disable
+
+            New-AzVM -ResourceGroupName $ResourceGroupName -Location $Location -VM $vmConfig -Tag $Tags | Out-Null
+
+            Write-Host "Waiting for VM to be fully provisioned..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 30
+            $vmCheck = Get-AzVM -Name $VMName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+            while ($vmCheck.ProvisioningState -ne "Succeeded") {
+                Write-Host "  VM provisioning state: $($vmCheck.ProvisioningState)..." -ForegroundColor Yellow
+                Start-Sleep -Seconds 10
+                $vmCheck = Get-AzVM -Name $VMName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+            }
+            Write-Host "✓ VM created successfully" -ForegroundColor Green
+        } else {
+            Write-Host "✓ VM already exists: $VMName" -ForegroundColor Green
+        }
+
+        # Enable system-assigned managed identity on the VM
+        Write-Host "Enabling managed identity on VM..." -ForegroundColor Yellow
+        $vm = Get-AzVM -Name $VMName -ResourceGroupName $ResourceGroupName
+        if ($vm.Identity.Type -ne "SystemAssigned" -and $vm.Identity.Type -ne "SystemAssigned, UserAssigned") {
+            Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm -IdentityType SystemAssigned | Out-Null
+            Start-Sleep -Seconds 10
+            $vm = Get-AzVM -Name $VMName -ResourceGroupName $ResourceGroupName
+        }
+        Write-Host "✓ VM managed identity enabled (Principal ID: $($vm.Identity.PrincipalId))" -ForegroundColor Green
+
+        # Install PowerShell 7 (required for PowerShell72 runbooks)
+        Write-Host "Installing PowerShell 7..." -ForegroundColor Yellow
+        $installPwshScript = @'
+#!/bin/bash
+set -e
+if command -v pwsh &> /dev/null; then
+    echo "PowerShell 7 already installed at: $(which pwsh)"
+else
+    echo "Installing PowerShell 7 via snap..."
+    snap install powershell --classic
+    echo "PowerShell 7 installed successfully"
+fi
+
+# Find pwsh and set environment variable
+pwshPath=$(which pwsh)
+if [ -n "$pwshPath" ]; then
+    echo "powershell_7_2_path=$pwshPath" >> /etc/environment
+    echo "Environment variable set to: $pwshPath"
+else
+    echo "ERROR: pwsh not found in PATH after installation"
+    exit 1
+fi
+'@
+        $commandId = "RunShellScript"
+
+        $installResult = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -CommandId $commandId -ScriptString $installPwshScript
+        Write-Host "  $($installResult.Value[0].Message)" -ForegroundColor Gray
+        Write-Host "✓ PowerShell 7 installation complete" -ForegroundColor Green
+
+        # Install Azure PowerShell modules required for runbook execution
+        Write-Host "Installing Azure PowerShell modules on VM..." -ForegroundColor Yellow
+        $bashScript = @'
+#!/bin/bash
+/snap/bin/pwsh << 'PWSHEOF'
+$requiredModules = @('Az.Accounts', 'Az.Storage', 'Az.Automation')
+$progressPreference = 'SilentlyContinue'
+foreach ($module in $requiredModules) {
+    Write-Output "Installing $module..."
+    Install-Module -Name $module -Repository PSGallery -Force -AllowClobber -Scope AllUsers -ErrorAction SilentlyContinue
+    Write-Output "  [OK] $module installed"
+}
+Write-Output "[OK] All required modules installed successfully"
+PWSHEOF
+'@
+
+        $moduleInstallResult = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -CommandId "RunShellScript" -ScriptString $bashScript
+        Write-Host "  $($moduleInstallResult.Value[0].Message)" -ForegroundColor Gray
+        Write-Host "✓ Azure PowerShell modules installation complete" -ForegroundColor Green
+
+        # Create Hybrid Worker Group
+        Write-Host "Creating Hybrid Worker Group: $WorkerGroupName..." -ForegroundColor Yellow
+        $existingGroup = Get-AzAutomationHybridRunbookWorkerGroup -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WorkerGroupName -ErrorAction SilentlyContinue
+        if (-not $existingGroup) {
+            New-AzAutomationHybridRunbookWorkerGroup -AutomationAccountName $AutomationAccountName -Name $WorkerGroupName -ResourceGroupName $ResourceGroupName
+            Write-Host "✓ Hybrid Worker Group created" -ForegroundColor Green
+        } else {
+            Write-Host "✓ Hybrid Worker Group already exists" -ForegroundColor Green
+        }
+
+        # Register VM as Hybrid Worker
+        $vmResourceId = $vm.Id
+        $existingWorkers = Get-AzAutomationHybridRunbookWorker -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -HybridRunbookWorkerGroupName $WorkerGroupName -ErrorAction SilentlyContinue
+        $alreadyRegistered = $existingWorkers | Where-Object { $_.VmResourceId -eq $vmResourceId }
+        if (-not $alreadyRegistered) {
+            Write-Host "Registering VM as Hybrid Worker..." -ForegroundColor Yellow
+            New-AzAutomationHybridRunbookWorker -Name ([guid]::NewGuid().ToString()) -VmResourceId $vmResourceId -HybridRunbookWorkerGroupName $WorkerGroupName -AutomationAccountName $AutomationAccountName -ResourceGroupName $ResourceGroupName
+            Write-Host "✓ VM registered as Hybrid Worker" -ForegroundColor Green
+        } else {
+            Write-Host "✓ VM already registered as Hybrid Worker" -ForegroundColor Green
+        }
+
+        # Install Hybrid Worker Extension
+        Write-Host "Installing Hybrid Worker Extension on VM..." -ForegroundColor Yellow
+        $aaResource = Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceType "Microsoft.Automation/automationAccounts" -Name $AutomationAccountName
+        $aaDetails = Get-AzResource -ResourceId $aaResource.ResourceId -ApiVersion "2023-11-01"
+        $extensionSettings = @{ "AutomationAccountURL" = $aaDetails.Properties.automationHybridServiceUrl }
+
+        # Install Hybrid Worker Extension
+        $extensionType = "HybridWorkerForLinux"
+        $existingExtension = Get-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $VMName -Name "HybridWorkerExtension" -ErrorAction SilentlyContinue
+        if (-not $existingExtension) {
+            Set-AzVMExtension -ResourceGroupName $ResourceGroupName -Location $Location -VMName $VMName -Name "HybridWorkerExtension" -Publisher "Microsoft.Azure.Automation.HybridWorker" -ExtensionType $extensionType -TypeHandlerVersion "1.1" -Settings $extensionSettings -EnableAutomaticUpgrade $true
+            Write-Host "✓ Hybrid Worker Extension installed ($extensionType)" -ForegroundColor Green
+        } else {
+            Write-Host "✓ Hybrid Worker Extension already installed" -ForegroundColor Green
+        }
+
+        # Restart Hybrid Worker service
+        Write-Host "Restarting Hybrid Worker service..." -ForegroundColor Yellow
+        $restartResult = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -CommandId "RunShellScript" -ScriptString 'sudo systemctl restart waagent; echo "Hybrid Worker service restarted"'
+        Write-Host "  $($restartResult.Value[0].Message)" -ForegroundColor Gray
+        Write-Host "✓ Hybrid Worker service restarted" -ForegroundColor Green
+    }
+
+    # Step 7 (was 6): Create Schedule
+    Write-Host "`n[7] Creating Schedule: $ScheduleName" -ForegroundColor Cyan
+
     # Check if schedule exists
     $existingSchedule = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -ErrorAction SilentlyContinue
 
@@ -293,36 +406,57 @@ try {
         Remove-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -Force
     }
 
-   New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -StartTime $ScheduleStartTime -TimeZone (Get-TimeZone).Id -DayInterval $ScheduleInterval
+    New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $ScheduleName -StartTime $ScheduleStartTime -TimeZone (Get-TimeZone).Id -DayInterval $ScheduleInterval
 
     Write-Host "✓ Schedule created successfully" -ForegroundColor Green
     Write-Host "  Frequency: Every $ScheduleInterval $ScheduleFrequency(s)" -ForegroundColor Gray
     Write-Host "  Start Time: $ScheduleStartTime" -ForegroundColor Gray
     Write-Host "  Time Zone: $((Get-TimeZone).Id)" -ForegroundColor Gray
 
-    # Step 7: Link Schedule to Runbook
-    Write-Host "`n[7/8] Linking Schedule to Runbook" -ForegroundColor Cyan
-    
-    Register-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -RunbookName $RunbookName -ScheduleName $ScheduleName
-    
-    Write-Host "✓ Schedule linked to runbook successfully" -ForegroundColor Green
-    Write-Host "  Note: Runbook will retrieve parameterTable from automation variable: $variableName" -ForegroundColor Gray
+    # Step 8 (was 7): Link Schedule to Runbook
+    Write-Host "`n[8] Linking Schedule to Runbook" -ForegroundColor Cyan
 
-    # Step 8: Create Webhook with authentication
-    Write-Host "`n[8/8] Creating Webhook: $WebhookName" -ForegroundColor Cyan
-    
+    $scheduleParams = @{
+        ResourceGroupName     = $ResourceGroupName
+        AutomationAccountName = $AutomationAccountName
+        RunbookName           = $RunbookName
+        ScheduleName          = $ScheduleName
+    }
+    if ($useHybridWorker) {
+        $scheduleParams["RunOn"] = $WorkerGroupName
+        Write-Host "  Targeting Hybrid Worker Group: $WorkerGroupName" -ForegroundColor Gray
+    }
+    Register-AzAutomationScheduledRunbook @scheduleParams
+
+    Write-Host "✓ Schedule linked to runbook successfully" -ForegroundColor Green
+
+    # Step 9 (was 8): Create Webhook
+    Write-Host "`n[9] Creating Webhook: $WebhookName" -ForegroundColor Cyan
+
     # Check if webhook exists and remove it
     $existingWebhook = Get-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName -ErrorAction SilentlyContinue
 
     if ($existingWebhook) {
         Write-Host "Webhook already exists. Removing old webhook..." -ForegroundColor Yellow
-        Remove-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName 
+        Remove-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $WebhookName
     }
 
     # Create webhook with expiry
     $webhookExpiryDate = (Get-Date).AddYears($WebhookExpiryYears)
-    
-    $webhook = New-AzAutomationWebhook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -RunbookName $RunbookName -Name $WebhookName -IsEnabled $true -ExpiryTime $webhookExpiryDate -Force
+
+    $webhookParams = @{
+        ResourceGroupName     = $ResourceGroupName
+        AutomationAccountName = $AutomationAccountName
+        RunbookName           = $RunbookName
+        Name                  = $WebhookName
+        IsEnabled             = $true
+        ExpiryTime            = $webhookExpiryDate
+        Force                 = $true
+    }
+    if ($useHybridWorker) {
+        $webhookParams["RunOn"] = $WorkerGroupName
+    }
+    $webhook = New-AzAutomationWebhook @webhookParams
 
     Write-Host "✓ Webhook created successfully" -ForegroundColor Green
     Write-Host "  Expires: $webhookExpiryDate" -ForegroundColor Gray
@@ -349,9 +483,17 @@ Invoke-RestMethod -Uri `$uri -Method Post -Headers `$headers -Body `$body
     Write-Host "`n" + ("=" * 80) -ForegroundColor Green
     Write-Host "SETUP COMPLETE!" -ForegroundColor Green
     Write-Host ("=" * 80) -ForegroundColor Green
+    Write-Host "Mode:                 $(if ($useHybridWorker) { 'Hybrid Worker' } else { 'Cloud Automation' })" -ForegroundColor White
     Write-Host "Resource Group:       $ResourceGroupName" -ForegroundColor White
     Write-Host "Automation Account:   $AutomationAccountName" -ForegroundColor White
     Write-Host "Location:             $Location" -ForegroundColor White
+    if ($useHybridWorker) {
+        Write-Host "Hybrid Worker VM:     $VMName ($VMSize)" -ForegroundColor White
+        Write-Host "VM Operating System:  Ubuntu 22.04 LTS" -ForegroundColor White
+        Write-Host "Hybrid Worker Group:  $WorkerGroupName" -ForegroundColor White
+        Write-Host "VM Subnet:            $vnetSubnetId" -ForegroundColor White
+        Write-Host "SSH Private Key:      $sshPrivateKeyPath" -ForegroundColor Cyan
+    }
     Write-Host "Runbook:              $RunbookName (Published)" -ForegroundColor White
     Write-Host "Variable:             $variableName (parameterTable stored)" -ForegroundColor White
     Write-Host "Schedule:             $ScheduleName (Every $ScheduleInterval $ScheduleFrequency(s))" -ForegroundColor White
@@ -359,19 +501,24 @@ Invoke-RestMethod -Uri `$uri -Method Post -Headers `$headers -Body `$body
     Write-Host ("=" * 80) -ForegroundColor Green
 
     # Return object with all details
-
     $results = [PSCustomObject] @{
-        ResourceGroup = $ResourceGroupName
+        Mode              = if ($useHybridWorker) { "HybridWorker" } else { "CloudAutomation" }
+        ResourceGroup     = $ResourceGroupName
         AutomationAccount = $AutomationAccountName
-        Location = $Location
-        Runbook = $RunbookName
-        Variable = $variableName
-        Schedule = $ScheduleName
+        Location          = $Location
+        HybridWorkerVM    = if ($useHybridWorker) { $VMName } else { $null }
+        HybridWorkerGroup = if ($useHybridWorker) { $WorkerGroupName } else { $null }
+        VMOperatingSystem = if ($useHybridWorker) { "Ubuntu 22.04 LTS" } else { $null }
+        VMAdminUser       = if ($useHybridWorker) { $VMAdminUser } else { $null }
+        SSHPrivateKeyPath = if ($useHybridWorker) { $sshPrivateKeyPath } else { $null }
+        Runbook           = $RunbookName
+        Variable          = $variableName
+        Schedule          = $ScheduleName
         ScheduleFrequency = "$ScheduleInterval $ScheduleFrequency(s)"
         ScheduleStartTime = $ScheduleStartTime
-        Webhook = $WebhookName
-        WebhookURI = $webhook.WebhookURI
-        WebhookExpiry = $webhookExpiryDate
+        Webhook           = $WebhookName
+        WebhookURI        = $webhook.WebhookURI
+        WebhookExpiry     = $webhookExpiryDate
     }
 
     $resultsJson = $results | ConvertTo-Json -Depth 5
@@ -384,26 +531,26 @@ Invoke-RestMethod -Uri `$uri -Method Post -Headers `$headers -Body `$body
         $customerToken = $parameterTable.customerToken
         $resultsFileName = "$siteName-runbook.json"
         $containerName = 'runbooks'
-        
+
         # Create destination context using SAS token
         $destinationContext = New-AzStorageContext -StorageAccountName $customerStorageAccount -SasToken $customerToken
-        
+
         # Create file in current directory
         $tempJsonPath = Join-Path (Get-Location) $resultsFileName
         $resultsJson | Out-File -FilePath $tempJsonPath -Encoding utf8 -Force
-        
+
         # Create container if it doesn't exist
         $destinationContainer = Get-AzStorageContainer -Name $containerName -Context $destinationContext -ErrorAction SilentlyContinue
         if (-not $destinationContainer) {
             Write-Host "Creating destination container: $containerName" -ForegroundColor Yellow
             New-AzStorageContainer -Name $containerName -Context $destinationContext -Permission Off | Out-Null
         }
-        
+
         # Upload to customer storage account
         Set-AzStorageBlobContent -File $tempJsonPath -Container $containerName -Blob $resultsFileName -Context $destinationContext -Force | Out-Null
-        
+
         Write-Host "✓ Results uploaded: $resultsFileName to $customerStorageAccount/$containerName" -ForegroundColor Green
-        
+
         # Clean up temp file
         Remove-Item -Path $tempJsonPath -Force -ErrorAction SilentlyContinue
     }
