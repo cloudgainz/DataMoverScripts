@@ -470,15 +470,21 @@ try {
     $modifiedFilterExpr = "@if(greater(pipeline().parameters.lookbackDays, 0), formatDateTime(addDays(utcnow(), mul(pipeline().parameters.lookbackDays, -1)), 'yyyy-MM-ddTHH:mm:ssZ'), '1900-01-01T00:00:00Z')"
 
     $successBody = @{
-        runId           = "@{pipeline().RunId}"
-        pipeline        = "@{pipeline().Pipeline}"
-        mode            = "@{pipeline().parameters.mode}"
-        sourceFolder    = "@{pipeline().parameters.sourceFolderName}"
-        dateRange       = "@{variables('dateRange')}"
-        lookbackDays    = "@{pipeline().parameters.lookbackDays}"
-        triggerTime     = "@{string(pipeline().TriggerTime)}"
-        status          = "Succeeded"
+        runId             = "@{pipeline().RunId}"
+        pipeline          = "@{pipeline().Pipeline}"
+        mode              = "@{pipeline().parameters.mode}"
+        sourceFolder      = "@{pipeline().parameters.sourceFolderName}"
+        dateRange         = "@{variables('dateRange')}"
+        lookbackDays      = "@{pipeline().parameters.lookbackDays}"
+        triggerTime       = "@{string(pipeline().TriggerTime)}"
+        status            = "Succeeded"
         guidFoldersCopied = "@{length(activity('FilterGuids').output.Value)}"
+        filesRead         = "@{variables('filesRead')}"
+        filesWritten      = "@{variables('filesWritten')}"
+        dataReadBytes     = "@{variables('dataRead')}"
+        dataWrittenBytes  = "@{variables('dataWritten')}"
+        copyDurationSeconds = "@{variables('copyDuration')}"
+        throughputMBps    = "@{if(greater(int(variables('copyDuration')), 0), div(div(int(variables('dataWritten')), 1048576), int(variables('copyDuration'))), 0)}"
     }
 
     $failureBody = @{
@@ -518,6 +524,12 @@ try {
                 targetDate       = @{ type = "String" }
                 dateRange        = @{ type = "String" }
                 dateRangeFolder  = @{ type = "String" }
+                filesRead        = @{ type = "String"; defaultValue = "0" }
+                filesWritten     = @{ type = "String"; defaultValue = "0" }
+                dataRead         = @{ type = "String"; defaultValue = "0" }
+                dataWritten      = @{ type = "String"; defaultValue = "0" }
+                copyDuration     = @{ type = "String"; defaultValue = "0" }
+                accWork          = @{ type = "String"; defaultValue = "0" }
             }
             activities = @(
                 # SetTargetDate — current or prior month anchor date
@@ -560,14 +572,14 @@ try {
                     name      = "ListGuids"
                     type      = "GetMetadata"
                     dependsOn = @( @{ activity = "SetDateRangeFolder"; dependencyConditions = @("Succeeded") } )
-                    dataset = @{
-                        referenceName = $SourceDatasetName
-                        type          = "DatasetReference"
-                        parameters = @{
-                            folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
-                        }
-                    }
                     typeProperties = @{
+                        dataset = @{
+                            referenceName = $SourceDatasetName
+                            type          = "DatasetReference"
+                            parameters = @{
+                                folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
+                            }
+                        }
                         fieldList = @("childItems")
                         storeSettings = @{ type = "AzureBlobStorageReadSettings"; recursive = $false }
                         formatSettings = @{ type = "BinaryReadSettings" }
@@ -583,18 +595,18 @@ try {
                         condition = @{ value = "@equals(item().type, 'Folder')"; type = "Expression" }
                     }
                 },
-                # ForEachGuid — one Copy per guid directory. Because we scope the Copy to
-                # {dateRange}/{guid}/, the blob-listing prefix excludes the placeholder at
-                # {dateRange}/{guid} (no trailing slash). modifiedDatetimeStart applies the
-                # date window before any per-file work.
+                # ForEachGuid — one Copy per guid directory. Sequential so per-iteration
+                # SetVariable accumulators are race-free. With ~dozen folders per run this
+                # is fast enough. Scoping Copy to {dateRange}/{guid}/ naturally excludes the
+                # placeholder blob at {dateRange}/{guid} (no trailing slash); the
+                # modifiedDatetimeStart filter applies the date window before any per-file work.
                 @{
                     name      = "ForEachGuid"
                     type      = "ForEach"
                     dependsOn = @( @{ activity = "FilterGuids"; dependencyConditions = @("Succeeded") } )
                     typeProperties = @{
                         items        = @{ value = "@activity('FilterGuids').output.Value"; type = "Expression" }
-                        isSequential = $false
-                        batchCount   = 5
+                        isSequential = $true
                         activities   = @(
                             @{
                                 name = "CopyGuid"
@@ -631,6 +643,90 @@ try {
                                         type          = "BinarySink"
                                         storeSettings = @{ type = "AzureBlobStorageWriteSettings" }
                                     }
+                                }
+                            },
+                            # Per-iteration accumulators — ADF forbids a SetVariable from
+                            # referencing its own target, so we use a shared 'accWork' variable
+                            # as a stepping stone: compute into accWork, then copy into the
+                            # real metric var. Chain all 10 activities so they serialize.
+                            @{
+                                name = "CalcFilesRead"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CopyGuid"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "accWork"
+                                    value = @{ value = "@string(add(int(variables('filesRead')), int(activity('CopyGuid').output.filesRead)))"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CommitFilesRead"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CalcFilesRead"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "filesRead"
+                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CalcFilesWritten"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CommitFilesRead"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "accWork"
+                                    value = @{ value = "@string(add(int(variables('filesWritten')), int(activity('CopyGuid').output.filesWritten)))"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CommitFilesWritten"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CalcFilesWritten"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "filesWritten"
+                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CalcDataRead"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CommitFilesWritten"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "accWork"
+                                    value = @{ value = "@string(add(int(variables('dataRead')), int(activity('CopyGuid').output.dataRead)))"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CommitDataRead"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CalcDataRead"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "dataRead"
+                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CalcDataWritten"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CommitDataRead"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "accWork"
+                                    value = @{ value = "@string(add(int(variables('dataWritten')), int(activity('CopyGuid').output.dataWritten)))"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CommitDataWritten"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CalcDataWritten"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "dataWritten"
+                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CalcCopyDuration"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CommitDataWritten"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "accWork"
+                                    value = @{ value = "@string(add(int(variables('copyDuration')), int(activity('CopyGuid').output.copyDuration)))"; type = "Expression" }
+                                }
+                            },
+                            @{
+                                name = "CommitCopyDuration"; type = "SetVariable"
+                                dependsOn = @( @{ activity = "CalcCopyDuration"; dependencyConditions = @("Succeeded") } )
+                                typeProperties = @{
+                                    variableName = "copyDuration"
+                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
                                 }
                             }
                         )
