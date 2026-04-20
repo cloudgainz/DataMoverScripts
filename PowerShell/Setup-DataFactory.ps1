@@ -42,7 +42,7 @@ $catchupRunTime      = if ($parameterTable.catchupRunTime)      { $parameterTabl
 $monthlyRunTime      = if ($parameterTable.monthlyRunTime)      { $parameterTable.monthlyRunTime }      else { '03:00' }
 $monthlyDayOfMonth   = if ($parameterTable.monthlyDayOfMonth)   { [int]$parameterTable.monthlyDayOfMonth }   else { 6 }
 $catchupCutoffDay    = if ($parameterTable.catchupCutoffDay)    { [int]$parameterTable.catchupCutoffDay }    else { 5 }
-$dailyLookbackDays   = if ($parameterTable.dailyLookbackDays)   { [int]$parameterTable.dailyLookbackDays }   else { 2 }
+$dailyLookbackDays   = if ($parameterTable.dailyLookbackDays)   { [int]$parameterTable.dailyLookbackDays }   else { 1 }
 $catchupLookbackDays = if ($parameterTable.catchupLookbackDays) { [int]$parameterTable.catchupLookbackDays } else { 7 }
 
 if ($catchupCutoffDay -lt 1 -or $catchupCutoffDay -gt 28) {
@@ -393,8 +393,9 @@ try {
     # =========================================================================
     Write-Host "`n[6] Creating Datasets" -ForegroundColor Cyan
 
-    # Source dataset — Binary, parameterized on sourceFolder + dateRange.
-    # Pipeline supplies these per run; full path = {normalizedPath}/{sourceFolder}/{dateRange}
+    # Source/Dest datasets — Binary, parameterized by folderPath.
+    # Pipeline drives folderPath per-guid so each Copy targets a single guid directory,
+    # which sidesteps the HNS directory-placeholder blobs that live at parent levels.
     Write-Host "Creating source dataset: $SourceDatasetName..." -ForegroundColor Yellow
     $sourceDatasetDef = @{
         name       = $SourceDatasetName
@@ -405,17 +406,13 @@ try {
                 type          = "LinkedServiceReference"
             }
             parameters = @{
-                sourceFolder = @{ type = "String" }
-                dateRange    = @{ type = "String" }
+                folderPath = @{ type = "String" }
             }
             typeProperties = @{
                 location = @{
-                    type      = "AzureBlobStorageLocation"
-                    container = $exportStorageContainer
-                    folderPath = @{
-                        value = "@concat('$normalizedPath', '/', dataset().sourceFolder, '/', dataset().dateRange)"
-                        type  = "Expression"
-                    }
+                    type       = "AzureBlobStorageLocation"
+                    container  = $exportStorageContainer
+                    folderPath = @{ value = "@dataset().folderPath"; type = "Expression" }
                 }
             }
         }
@@ -423,9 +420,8 @@ try {
     $tmpFile = New-TempAdfJson -Definition $sourceDatasetDef
     Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $SourceDatasetName -DefinitionFile $tmpFile -Force | Out-Null
     Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Source dataset created (parameterized: $exportStorageContainer/$normalizedPath/{sourceFolder}/{dateRange})" -ForegroundColor Green
+    Write-Host "✓ Source dataset created (parameterized: $exportStorageContainer/{folderPath})" -ForegroundColor Green
 
-    # Destination dataset — Binary, mirrors {sourceFolder}/{dateRange} on the customer side
     Write-Host "Creating destination dataset: $DestDatasetName..." -ForegroundColor Yellow
     $destDatasetDef = @{
         name       = $DestDatasetName
@@ -436,17 +432,13 @@ try {
                 type          = "LinkedServiceReference"
             }
             parameters = @{
-                sourceFolder = @{ type = "String" }
-                dateRange    = @{ type = "String" }
+                folderPath = @{ type = "String" }
             }
             typeProperties = @{
                 location = @{
-                    type      = "AzureBlobStorageLocation"
-                    container = $destContainerName
-                    folderPath = @{
-                        value = "@concat('$normalizedPath', '/', dataset().sourceFolder, '/', dataset().dateRange)"
-                        type  = "Expression"
-                    }
+                    type       = "AzureBlobStorageLocation"
+                    container  = $destContainerName
+                    folderPath = @{ value = "@dataset().folderPath"; type = "Expression" }
                 }
             }
         }
@@ -454,7 +446,7 @@ try {
     $tmpFile = New-TempAdfJson -Definition $destDatasetDef
     Set-AzDataFactoryV2Dataset -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $DestDatasetName -DefinitionFile $tmpFile -Force | Out-Null
     Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Destination dataset created (parameterized: $destContainerName/$normalizedPath/{sourceFolder}/{dateRange})" -ForegroundColor Green
+    Write-Host "✓ Destination dataset created (parameterized: $destContainerName/{folderPath})" -ForegroundColor Green
 
     # =========================================================================
     # Step 7: Create Pipeline
@@ -478,20 +470,15 @@ try {
     $modifiedFilterExpr = "@if(greater(pipeline().parameters.lookbackDays, 0), formatDateTime(addDays(utcnow(), mul(pipeline().parameters.lookbackDays, -1)), 'yyyy-MM-ddTHH:mm:ssZ'), '1900-01-01T00:00:00Z')"
 
     $successBody = @{
-        runId               = "@{pipeline().RunId}"
-        pipeline            = "@{pipeline().Pipeline}"
-        mode                = "@{pipeline().parameters.mode}"
-        sourceFolder        = "@{pipeline().parameters.sourceFolderName}"
-        dateRange           = "@{variables('dateRange')}"
-        lookbackDays        = "@{pipeline().parameters.lookbackDays}"
-        triggerTime         = "@{string(pipeline().TriggerTime)}"
-        status              = "Succeeded"
-        dataReadBytes       = "@{activity('CopyBlobs').output.dataRead}"
-        dataWrittenBytes    = "@{activity('CopyBlobs').output.dataWritten}"
-        filesRead           = "@{activity('CopyBlobs').output.filesRead}"
-        filesWritten        = "@{activity('CopyBlobs').output.filesWritten}"
-        copyDurationSeconds = "@{activity('CopyBlobs').output.copyDuration}"
-        throughputMBps      = "@{activity('CopyBlobs').output.throughput}"
+        runId           = "@{pipeline().RunId}"
+        pipeline        = "@{pipeline().Pipeline}"
+        mode            = "@{pipeline().parameters.mode}"
+        sourceFolder    = "@{pipeline().parameters.sourceFolderName}"
+        dateRange       = "@{variables('dateRange')}"
+        lookbackDays    = "@{pipeline().parameters.lookbackDays}"
+        triggerTime     = "@{string(pipeline().TriggerTime)}"
+        status          = "Succeeded"
+        guidFoldersCopied = "@{length(activity('FilterGuids').output.Value)}"
     }
 
     $failureBody = @{
@@ -502,11 +489,11 @@ try {
         dateRange    = "@{variables('dateRange')}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "Failed"
-        errorCode    = "@{activity('CopyBlobs').error.errorCode}"
-        errorMessage = "@{activity('CopyBlobs').error.message}"
+        errorCode    = "@{activity('ForEachGuid').error.errorCode}"
+        errorMessage = "@{activity('ForEachGuid').error.message}"
     }
 
-    # Body for when the logging activity itself errors (CopyBlobs succeeded but WriteSuccessLog failed)
+    # Body for when the logging activity itself errors (copies succeeded but WriteSuccessLog failed)
     $logErrorBody = @{
         runId        = "@{pipeline().RunId}"
         pipeline     = "@{pipeline().Pipeline}"
@@ -515,7 +502,7 @@ try {
         status       = "LoggingError"
         errorCode    = "@{activity('WriteSuccessLog').error.errorCode}"
         errorMessage = "@{activity('WriteSuccessLog').error.message}"
-        note         = "CopyBlobs succeeded but the success log write failed"
+        note         = "Copy succeeded but the success log write failed"
     }
 
     $pipelineDef = @{
@@ -528,13 +515,12 @@ try {
                 mode             = @{ type = "String"; defaultValue = "daily" }
             }
             variables = @{
-                targetDate = @{ type = "String" }
-                dateRange  = @{ type = "String" }
+                targetDate       = @{ type = "String" }
+                dateRange        = @{ type = "String" }
+                dateRangeFolder  = @{ type = "String" }
             }
             activities = @(
-                # ------------------------------------------------------------------
-                # SetTargetDate: compute timestamp for current or prior month
-                # ------------------------------------------------------------------
+                # SetTargetDate — current or prior month anchor date
                 @{
                     name = "SetTargetDate"
                     type = "SetVariable"
@@ -543,79 +529,119 @@ try {
                         value        = @{ value = $targetDateExpr; type = "Expression" }
                     }
                 },
-                # ------------------------------------------------------------------
-                # SetDateRange: format yyyyMMdd-yyyyMMdd for the target month
-                # ------------------------------------------------------------------
+                # SetDateRange — yyyyMMdd-yyyyMMdd for the target month
                 @{
                     name      = "SetDateRange"
                     type      = "SetVariable"
-                    dependsOn = @(
-                        @{ activity = "SetTargetDate"; dependencyConditions = @("Succeeded") }
-                    )
+                    dependsOn = @( @{ activity = "SetTargetDate"; dependencyConditions = @("Succeeded") } )
                     typeProperties = @{
                         variableName = "dateRange"
                         value        = @{ value = $dateRangeExpr; type = "Expression" }
                     }
                 },
-                # ------------------------------------------------------------------
-                # CopyBlobs: copy {sourceFolder}/{dateRange}/** to mirrored path
-                # ------------------------------------------------------------------
+                # SetDateRangeFolder — full prefix {exportsDir}/{sourceFolder}/{dateRange}
                 @{
-                    name      = "CopyBlobs"
-                    type      = "Copy"
-                    dependsOn = @(
-                        @{ activity = "SetDateRange"; dependencyConditions = @("Succeeded") }
-                    )
-                    inputs  = @(
-                        @{
-                            referenceName = $SourceDatasetName
-                            type          = "DatasetReference"
-                            parameters = @{
-                                sourceFolder = "@pipeline().parameters.sourceFolderName"
-                                dateRange    = "@variables('dateRange')"
-                            }
-                        }
-                    )
-                    outputs = @(
-                        @{
-                            referenceName = $DestDatasetName
-                            type          = "DatasetReference"
-                            parameters = @{
-                                sourceFolder = "@pipeline().parameters.sourceFolderName"
-                                dateRange    = "@variables('dateRange')"
-                            }
-                        }
-                    )
+                    name      = "SetDateRangeFolder"
+                    type      = "SetVariable"
+                    dependsOn = @( @{ activity = "SetDateRange"; dependencyConditions = @("Succeeded") } )
                     typeProperties = @{
-                        source = @{
-                            type          = "BinarySource"
-                            storeSettings = @{
-                                type                       = "AzureBlobStorageReadSettings"
-                                recursive                  = $true
-                                wildcardFileName           = "*"
-                                modifiedDatetimeStart      = @{
-                                    value = $modifiedFilterExpr
-                                    type  = "Expression"
-                                }
-                                deleteFilesAfterCompletion = $false
-                            }
-                        }
-                        sink = @{
-                            type          = "BinarySink"
-                            storeSettings = @{
-                                type = "AzureBlobStorageWriteSettings"
-                            }
+                        variableName = "dateRangeFolder"
+                        value = @{
+                            value = "@concat('$normalizedPath', '/', pipeline().parameters.sourceFolderName, '/', variables('dateRange'))"
+                            type  = "Expression"
                         }
                     }
                 },
-                # ------------------------------------------------------------------
-                # WriteSuccessLog: PUT a JSON summary blob on successful copy
-                # ------------------------------------------------------------------
+                # ListGuids — list children under dateRange folder. Each Azure Cost Management
+                # export writes to a fresh guid directory; we pick these up as childItems of
+                # type 'Folder'. HNS placeholder blobs at the dateRange level show up as type
+                # 'File' with the same name — they're excluded by FilterGuids below.
+                @{
+                    name      = "ListGuids"
+                    type      = "GetMetadata"
+                    dependsOn = @( @{ activity = "SetDateRangeFolder"; dependencyConditions = @("Succeeded") } )
+                    dataset = @{
+                        referenceName = $SourceDatasetName
+                        type          = "DatasetReference"
+                        parameters = @{
+                            folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
+                        }
+                    }
+                    typeProperties = @{
+                        fieldList = @("childItems")
+                        storeSettings = @{ type = "AzureBlobStorageReadSettings"; recursive = $false }
+                        formatSettings = @{ type = "BinaryReadSettings" }
+                    }
+                },
+                # FilterGuids — keep only directory entries (drops the same-named marker blobs)
+                @{
+                    name      = "FilterGuids"
+                    type      = "Filter"
+                    dependsOn = @( @{ activity = "ListGuids"; dependencyConditions = @("Succeeded") } )
+                    typeProperties = @{
+                        items     = @{ value = "@activity('ListGuids').output.childItems"; type = "Expression" }
+                        condition = @{ value = "@equals(item().type, 'Folder')"; type = "Expression" }
+                    }
+                },
+                # ForEachGuid — one Copy per guid directory. Because we scope the Copy to
+                # {dateRange}/{guid}/, the blob-listing prefix excludes the placeholder at
+                # {dateRange}/{guid} (no trailing slash). modifiedDatetimeStart applies the
+                # date window before any per-file work.
+                @{
+                    name      = "ForEachGuid"
+                    type      = "ForEach"
+                    dependsOn = @( @{ activity = "FilterGuids"; dependencyConditions = @("Succeeded") } )
+                    typeProperties = @{
+                        items        = @{ value = "@activity('FilterGuids').output.Value"; type = "Expression" }
+                        isSequential = $false
+                        batchCount   = 5
+                        activities   = @(
+                            @{
+                                name = "CopyGuid"
+                                type = "Copy"
+                                inputs  = @(
+                                    @{
+                                        referenceName = $SourceDatasetName
+                                        type          = "DatasetReference"
+                                        parameters = @{
+                                            folderPath = @{ value = "@concat(variables('dateRangeFolder'), '/', item().name)"; type = "Expression" }
+                                        }
+                                    }
+                                )
+                                outputs = @(
+                                    @{
+                                        referenceName = $DestDatasetName
+                                        type          = "DatasetReference"
+                                        parameters = @{
+                                            folderPath = @{ value = "@concat(variables('dateRangeFolder'), '/', item().name)"; type = "Expression" }
+                                        }
+                                    }
+                                )
+                                typeProperties = @{
+                                    source = @{
+                                        type          = "BinarySource"
+                                        storeSettings = @{
+                                            type                       = "AzureBlobStorageReadSettings"
+                                            recursive                  = $true
+                                            modifiedDatetimeStart      = @{ value = $modifiedFilterExpr; type = "Expression" }
+                                            deleteFilesAfterCompletion = $false
+                                        }
+                                    }
+                                    sink = @{
+                                        type          = "BinarySink"
+                                        storeSettings = @{ type = "AzureBlobStorageWriteSettings" }
+                                    }
+                                }
+                            }
+                        )
+                    }
+                },
+                # WriteSuccessLog — PUT a JSON summary blob on success
                 @{
                     name      = "WriteSuccessLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "CopyBlobs"; dependencyConditions = @("Succeeded") }
+                        @{ activity = "ForEachGuid"; dependencyConditions = @("Succeeded") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
@@ -634,7 +660,7 @@ try {
                     name      = "WriteFailureLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "CopyBlobs"; dependencyConditions = @("Failed") }
+                        @{ activity = "ForEachGuid"; dependencyConditions = @("Failed") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
