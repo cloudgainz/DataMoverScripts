@@ -30,20 +30,19 @@ $exportsDirectory = $parameterTable.exportsDirectory
 $customerStorageAccount = $parameterTable.customerStorageAccount
 $customerToken = $parameterTable.customerToken
 
-# Folder names under exportsDirectory for the three data classes
+# Folder names under exportsDirectory — daily and monthly cadence outputs
 $dailiesFolder   = $parameterTable.dailiesFolder
 $monthliesFolder = $parameterTable.monthliesFolder
-$onetimeFolder   = $parameterTable.onetimeFolder
 
-# Scheduling — all run times are HH:mm, interpreted in $timeZone
-$timeZone            = if ($parameterTable.timeZone)            { $parameterTable.timeZone }            else { 'Eastern Standard Time' }
-$dailyRunTime        = if ($parameterTable.dailyRunTime)        { $parameterTable.dailyRunTime }        else { '02:00' }
-$catchupRunTime      = if ($parameterTable.catchupRunTime)      { $parameterTable.catchupRunTime }      else { '02:30' }
-$monthlyRunTime      = if ($parameterTable.monthlyRunTime)      { $parameterTable.monthlyRunTime }      else { '03:00' }
-$monthlyDayOfMonth   = if ($parameterTable.monthlyDayOfMonth)   { [int]$parameterTable.monthlyDayOfMonth }   else { 6 }
-$catchupCutoffDay    = if ($parameterTable.catchupCutoffDay)    { [int]$parameterTable.catchupCutoffDay }    else { 5 }
-$dailyLookbackDays   = if ($parameterTable.dailyLookbackDays)   { [int]$parameterTable.dailyLookbackDays }   else { 1 }
-$catchupLookbackDays = if ($parameterTable.catchupLookbackDays) { [int]$parameterTable.catchupLookbackDays } else { 7 }
+# Scheduling — all run times are HH:mm, interpreted in $timeZone.
+# catchupCutoffDay is the integer N used in (today - N) to compute which
+# month folder to mirror. With N=5, runs on May 1-5 still target April; on
+# May 6+ they target May. Same calculation drives both Daily and Monthly.
+$timeZone          = if ($parameterTable.timeZone)          { $parameterTable.timeZone }          else { 'Eastern Standard Time' }
+$dailyRunTime      = if ($parameterTable.dailyRunTime)      { $parameterTable.dailyRunTime }      else { '02:00' }
+$monthlyRunTime    = if ($parameterTable.monthlyRunTime)    { $parameterTable.monthlyRunTime }    else { '03:00' }
+$monthlyDayOfMonth = if ($parameterTable.monthlyDayOfMonth) { [int]$parameterTable.monthlyDayOfMonth } else { 6 }
+$catchupCutoffDay  = if ($parameterTable.catchupCutoffDay)  { [int]$parameterTable.catchupCutoffDay }  else { 5 }
 
 if ($catchupCutoffDay -lt 1 -or $catchupCutoffDay -gt 28) {
     throw "parameterTable.catchupCutoffDay ($catchupCutoffDay) must be between 1 and 28"
@@ -52,8 +51,7 @@ if ($catchupCutoffDay -lt 1 -or $catchupCutoffDay -gt 28) {
 # Validate required folder names
 foreach ($pair in @(
     @{ Name = 'dailiesFolder';   Value = $dailiesFolder },
-    @{ Name = 'monthliesFolder'; Value = $monthliesFolder },
-    @{ Name = 'onetimeFolder';   Value = $onetimeFolder }
+    @{ Name = 'monthliesFolder'; Value = $monthliesFolder }
 )) {
     if ([string]::IsNullOrWhiteSpace($pair.Value)) {
         throw "parameterTable.$($pair.Name) is required"
@@ -66,8 +64,8 @@ Set-AzContext -Subscription $subscriptionName
 [string]$DataFactoryName         = $siteName + "-adf"
 [string]$PipelineName            = $siteName + "-DataMoverPipeline"
 [string]$DailyTriggerName        = $siteName + "-DailyTrigger"
-[string]$CatchupTriggerName      = $siteName + "-CatchupTrigger"
 [string]$MonthlyTriggerName      = $siteName + "-MonthlyTrigger"
+[string]$LegacyCatchupName       = $siteName + "-CatchupTrigger"  # for cleanup of pre-mirror deployments
 [string]$SourceLinkedServiceName = "SourceStorage"
 [string]$DestLinkedServiceName   = "DestStorage"
 [string]$SourceDatasetName       = "SourceBlobs"
@@ -93,7 +91,6 @@ function ConvertTo-RunTimeParts {
     return @{ Hour = [int]$parts[0]; Minute = [int]$parts[1] }
 }
 $dailyTime   = ConvertTo-RunTimeParts -TimeString $dailyRunTime
-$catchupTime = ConvertTo-RunTimeParts -TimeString $catchupRunTime
 $monthlyTime = ConvertTo-RunTimeParts -TimeString $monthlyRunTime
 
 # Webhook / remote-trigger variables (populated in Step 9)
@@ -454,37 +451,38 @@ try {
     Write-Host "`n[7] Creating Pipeline: $PipelineName" -ForegroundColor Cyan
 
     # Pipeline parameters (supplied by triggers / on-demand caller):
-    #   sourceFolderName  — subfolder of $normalizedPath to copy from (dailies/monthly/onetime)
-    #   monthOffset       — 0 = current month folder, -1 = previous month folder
-    #   lookbackDays      — LastModified filter window in days (0 = no filter, grab all)
-    #   mode              — label for log/audit (daily/catchup/monthly/onetime)
+    #   sourceFolderName  — subfolder of $normalizedPath to mirror (dailies / monthlies)
+    #   catchupDays       — integer N; pipeline mirrors the month folder for (today - N).
+    #                       For first N days of any new month this lands in the prior month;
+    #                       afterwards it's the current month. Same value drives Daily and Monthly.
+    #   mode              — label for log/audit (daily / monthly)
     #
-    # Pipeline computes dateRange ('yyyyMMdd-yyyyMMdd') at run time from monthOffset
-    # in $timeZone, then copies {sourceFolderName}/{dateRange}/** to the same path
-    # on the customer side. Run summary written to logs/{siteName}-{mode}-{RunId}.json
+    # Pipeline computes dateRange ('yyyyMMdd-yyyyMMdd') from (today - catchupDays) in
+    # $timeZone, then mirrors {sourceFolderName}/{dateRange}/** to the same path on
+    # the customer side: Delete the destination folder entirely, then Copy the source
+    # folder as-is (recursive, no date filter). Run summary written to
+    # logs/{siteName}-{mode}-{RunId}.json
     $logBlobUrlExpr = "@concat('https://$customerStorageAccount.blob.core.windows.net/logs/$siteName-', pipeline().parameters.mode, '-', pipeline().RunId, '.json?$customerToken')"
 
     # ADF expressions kept as PowerShell variables for readability
-    $targetDateExpr = "@if(equals(pipeline().parameters.monthOffset, 0), convertTimeZone(utcnow(), 'UTC', '$timeZone'), subtractFromTime(convertTimeZone(utcnow(), 'UTC', '$timeZone'), 1, 'Month'))"
+    $targetDateExpr = "@addDays(convertTimeZone(utcnow(), 'UTC', '$timeZone'), mul(-1, pipeline().parameters.catchupDays))"
     $dateRangeExpr  = "@concat(formatDateTime(startOfMonth(variables('targetDate')), 'yyyyMMdd'), '-', formatDateTime(addDays(addToTime(startOfMonth(variables('targetDate')), 1, 'Month'), -1), 'yyyyMMdd'))"
-    $modifiedFilterExpr = "@if(greater(pipeline().parameters.lookbackDays, 0), formatDateTime(addDays(utcnow(), mul(pipeline().parameters.lookbackDays, -1)), 'yyyy-MM-ddTHH:mm:ssZ'), '1900-01-01T00:00:00Z')"
 
     $successBody = @{
-        runId             = "@{pipeline().RunId}"
-        pipeline          = "@{pipeline().Pipeline}"
-        mode              = "@{pipeline().parameters.mode}"
-        sourceFolder      = "@{pipeline().parameters.sourceFolderName}"
-        dateRange         = "@{variables('dateRange')}"
-        lookbackDays      = "@{pipeline().parameters.lookbackDays}"
-        triggerTime       = "@{string(pipeline().TriggerTime)}"
-        status            = "Succeeded"
-        guidFoldersCopied = "@{length(activity('FilterGuids').output.Value)}"
-        filesRead         = "@{variables('filesRead')}"
-        filesWritten      = "@{variables('filesWritten')}"
-        dataReadBytes     = "@{variables('dataRead')}"
-        dataWrittenBytes  = "@{variables('dataWritten')}"
-        copyDurationSeconds = "@{variables('copyDuration')}"
-        throughputMBps    = "@{if(greater(int(variables('copyDuration')), 0), div(div(int(variables('dataWritten')), 1048576), int(variables('copyDuration'))), 0)}"
+        runId        = "@{pipeline().RunId}"
+        pipeline     = "@{pipeline().Pipeline}"
+        mode         = "@{pipeline().parameters.mode}"
+        sourceFolder = "@{pipeline().parameters.sourceFolderName}"
+        dateRange    = "@{variables('dateRange')}"
+        catchupDays  = "@{pipeline().parameters.catchupDays}"
+        triggerTime  = "@{string(pipeline().TriggerTime)}"
+        status       = "Succeeded"
+        filesRead           = "@{activity('CopyMonthFolder').output.filesRead}"
+        filesWritten        = "@{activity('CopyMonthFolder').output.filesWritten}"
+        dataReadBytes       = "@{activity('CopyMonthFolder').output.dataRead}"
+        dataWrittenBytes    = "@{activity('CopyMonthFolder').output.dataWritten}"
+        copyDurationSeconds = "@{activity('CopyMonthFolder').output.copyDuration}"
+        throughputMBps      = "@{if(greater(int(activity('CopyMonthFolder').output.copyDuration), 0), div(div(int(activity('CopyMonthFolder').output.dataWritten), 1048576), int(activity('CopyMonthFolder').output.copyDuration)), 0)}"
     }
 
     $failureBody = @{
@@ -495,11 +493,11 @@ try {
         dateRange    = "@{variables('dateRange')}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "Failed"
-        errorCode    = "@{activity('ForEachGuid').error.errorCode}"
-        errorMessage = "@{activity('ForEachGuid').error.message}"
+        errorCode    = "@{coalesce(activity('DeleteDestFolder').error.errorCode, activity('CopyMonthFolder').error.errorCode)}"
+        errorMessage = "@{coalesce(activity('DeleteDestFolder').error.message, activity('CopyMonthFolder').error.message)}"
     }
 
-    # Body for when the logging activity itself errors (copies succeeded but WriteSuccessLog failed)
+    # Body for when the logging activity itself errors (copy succeeded but WriteSuccessLog failed)
     $logErrorBody = @{
         runId        = "@{pipeline().RunId}"
         pipeline     = "@{pipeline().Pipeline}"
@@ -516,23 +514,16 @@ try {
         properties = @{
             parameters = @{
                 sourceFolderName = @{ type = "String" }
-                monthOffset      = @{ type = "Int";    defaultValue = 0 }
-                lookbackDays     = @{ type = "Int";    defaultValue = $dailyLookbackDays }
+                catchupDays      = @{ type = "Int";    defaultValue = $catchupCutoffDay }
                 mode             = @{ type = "String"; defaultValue = "daily" }
             }
             variables = @{
-                targetDate       = @{ type = "String" }
-                dateRange        = @{ type = "String" }
-                dateRangeFolder  = @{ type = "String" }
-                filesRead        = @{ type = "String"; defaultValue = "0" }
-                filesWritten     = @{ type = "String"; defaultValue = "0" }
-                dataRead         = @{ type = "String"; defaultValue = "0" }
-                dataWritten      = @{ type = "String"; defaultValue = "0" }
-                copyDuration     = @{ type = "String"; defaultValue = "0" }
-                accWork          = @{ type = "String"; defaultValue = "0" }
+                targetDate      = @{ type = "String" }
+                dateRange       = @{ type = "String" }
+                dateRangeFolder = @{ type = "String" }
             }
             activities = @(
-                # SetTargetDate — current or prior month anchor date
+                # SetTargetDate — anchor date for which month folder to mirror
                 @{
                     name = "SetTargetDate"
                     type = "SetVariable"
@@ -564,172 +555,61 @@ try {
                         }
                     }
                 },
-                # ListGuids — list children under dateRange folder. Each Azure Cost Management
-                # export writes to a fresh guid directory; we pick these up as childItems of
-                # type 'Folder'. HNS placeholder blobs at the dateRange level show up as type
-                # 'File' with the same name — they're excluded by FilterGuids below.
+                # DeleteDestFolder — wipe the destination month folder before the copy so
+                # the dest mirrors the source exactly. Idempotent: if the folder doesn't
+                # exist yet, Delete reports 0 deleted and continues.
                 @{
-                    name      = "ListGuids"
-                    type      = "GetMetadata"
+                    name      = "DeleteDestFolder"
+                    type      = "Delete"
                     dependsOn = @( @{ activity = "SetDateRangeFolder"; dependencyConditions = @("Succeeded") } )
                     typeProperties = @{
                         dataset = @{
+                            referenceName = $DestDatasetName
+                            type          = "DatasetReference"
+                            parameters = @{
+                                folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
+                            }
+                        }
+                        enableLogging = $false
+                        storeSettings = @{ type = "AzureBlobStorageReadSettings"; recursive = $true }
+                    }
+                },
+                # CopyMonthFolder — copy the entire source month folder as-is. Recursive,
+                # no date filter, no per-guid iteration. Single activity, single output.
+                @{
+                    name      = "CopyMonthFolder"
+                    type      = "Copy"
+                    dependsOn = @( @{ activity = "DeleteDestFolder"; dependencyConditions = @("Succeeded") } )
+                    inputs = @(
+                        @{
                             referenceName = $SourceDatasetName
                             type          = "DatasetReference"
                             parameters = @{
                                 folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
                             }
                         }
-                        fieldList = @("childItems")
-                        storeSettings = @{ type = "AzureBlobStorageReadSettings"; recursive = $false }
-                        formatSettings = @{ type = "BinaryReadSettings" }
-                    }
-                },
-                # FilterGuids — keep only directory entries (drops the same-named marker blobs)
-                @{
-                    name      = "FilterGuids"
-                    type      = "Filter"
-                    dependsOn = @( @{ activity = "ListGuids"; dependencyConditions = @("Succeeded") } )
-                    typeProperties = @{
-                        items     = @{ value = "@activity('ListGuids').output.childItems"; type = "Expression" }
-                        condition = @{ value = "@equals(item().type, 'Folder')"; type = "Expression" }
-                    }
-                },
-                # ForEachGuid — one Copy per guid directory. Sequential so per-iteration
-                # SetVariable accumulators are race-free. With ~dozen folders per run this
-                # is fast enough. Scoping Copy to {dateRange}/{guid}/ naturally excludes the
-                # placeholder blob at {dateRange}/{guid} (no trailing slash); the
-                # modifiedDatetimeStart filter applies the date window before any per-file work.
-                @{
-                    name      = "ForEachGuid"
-                    type      = "ForEach"
-                    dependsOn = @( @{ activity = "FilterGuids"; dependencyConditions = @("Succeeded") } )
-                    typeProperties = @{
-                        items        = @{ value = "@activity('FilterGuids').output.Value"; type = "Expression" }
-                        isSequential = $true
-                        activities   = @(
-                            @{
-                                name = "CopyGuid"
-                                type = "Copy"
-                                inputs  = @(
-                                    @{
-                                        referenceName = $SourceDatasetName
-                                        type          = "DatasetReference"
-                                        parameters = @{
-                                            folderPath = @{ value = "@concat(variables('dateRangeFolder'), '/', item().name)"; type = "Expression" }
-                                        }
-                                    }
-                                )
-                                outputs = @(
-                                    @{
-                                        referenceName = $DestDatasetName
-                                        type          = "DatasetReference"
-                                        parameters = @{
-                                            folderPath = @{ value = "@concat(variables('dateRangeFolder'), '/', item().name)"; type = "Expression" }
-                                        }
-                                    }
-                                )
-                                typeProperties = @{
-                                    source = @{
-                                        type          = "BinarySource"
-                                        storeSettings = @{
-                                            type                       = "AzureBlobStorageReadSettings"
-                                            recursive                  = $true
-                                            modifiedDatetimeStart      = @{ value = $modifiedFilterExpr; type = "Expression" }
-                                            deleteFilesAfterCompletion = $false
-                                        }
-                                    }
-                                    sink = @{
-                                        type          = "BinarySink"
-                                        storeSettings = @{ type = "AzureBlobStorageWriteSettings" }
-                                    }
-                                }
-                            },
-                            # Per-iteration accumulators — ADF forbids a SetVariable from
-                            # referencing its own target, so we use a shared 'accWork' variable
-                            # as a stepping stone: compute into accWork, then copy into the
-                            # real metric var. Chain all 10 activities so they serialize.
-                            @{
-                                name = "CalcFilesRead"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CopyGuid"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "accWork"
-                                    value = @{ value = "@string(add(int(variables('filesRead')), int(activity('CopyGuid').output.filesRead)))"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CommitFilesRead"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CalcFilesRead"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "filesRead"
-                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CalcFilesWritten"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CommitFilesRead"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "accWork"
-                                    value = @{ value = "@string(add(int(variables('filesWritten')), int(activity('CopyGuid').output.filesWritten)))"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CommitFilesWritten"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CalcFilesWritten"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "filesWritten"
-                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CalcDataRead"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CommitFilesWritten"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "accWork"
-                                    value = @{ value = "@string(add(int(variables('dataRead')), int(activity('CopyGuid').output.dataRead)))"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CommitDataRead"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CalcDataRead"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "dataRead"
-                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CalcDataWritten"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CommitDataRead"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "accWork"
-                                    value = @{ value = "@string(add(int(variables('dataWritten')), int(activity('CopyGuid').output.dataWritten)))"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CommitDataWritten"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CalcDataWritten"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "dataWritten"
-                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CalcCopyDuration"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CommitDataWritten"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "accWork"
-                                    value = @{ value = "@string(add(int(variables('copyDuration')), int(activity('CopyGuid').output.copyDuration)))"; type = "Expression" }
-                                }
-                            },
-                            @{
-                                name = "CommitCopyDuration"; type = "SetVariable"
-                                dependsOn = @( @{ activity = "CalcCopyDuration"; dependencyConditions = @("Succeeded") } )
-                                typeProperties = @{
-                                    variableName = "copyDuration"
-                                    value = @{ value = "@variables('accWork')"; type = "Expression" }
-                                }
+                    )
+                    outputs = @(
+                        @{
+                            referenceName = $DestDatasetName
+                            type          = "DatasetReference"
+                            parameters = @{
+                                folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
                             }
-                        )
+                        }
+                    )
+                    typeProperties = @{
+                        source = @{
+                            type          = "BinarySource"
+                            storeSettings = @{
+                                type      = "AzureBlobStorageReadSettings"
+                                recursive = $true
+                            }
+                        }
+                        sink = @{
+                            type          = "BinarySink"
+                            storeSettings = @{ type = "AzureBlobStorageWriteSettings" }
+                        }
                     }
                 },
                 # WriteSuccessLog — PUT a JSON summary blob on success
@@ -737,7 +617,7 @@ try {
                     name      = "WriteSuccessLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "ForEachGuid"; dependencyConditions = @("Succeeded") }
+                        @{ activity = "CopyMonthFolder"; dependencyConditions = @("Succeeded") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
@@ -749,14 +629,13 @@ try {
                         body = $successBody
                     }
                 },
-                # ------------------------------------------------------------------
-                # WriteFailureLog: PUT a JSON error summary blob on failed copy
-                # ------------------------------------------------------------------
+                # WriteFailureLog: PUT a JSON error summary blob if Delete OR Copy failed
                 @{
                     name      = "WriteFailureLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "ForEachGuid"; dependencyConditions = @("Failed") }
+                        @{ activity = "DeleteDestFolder"; dependencyConditions = @("Failed") },
+                        @{ activity = "CopyMonthFolder";  dependencyConditions = @("Failed") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
@@ -768,9 +647,7 @@ try {
                         body = $failureBody
                     }
                 },
-                # ------------------------------------------------------------------
                 # WriteLogError: fallback if WriteSuccessLog itself fails
-                # ------------------------------------------------------------------
                 @{
                     name      = "WriteLogError"
                     type      = "WebActivity"
@@ -793,11 +670,14 @@ try {
     $tmpFile = New-TempAdfJson -Definition $pipelineDef
     Set-AzDataFactoryV2Pipeline -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $PipelineName -DefinitionFile $tmpFile -Force | Out-Null
     Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-    Write-Host "✓ Pipeline created (mode-driven; copies {sourceFolderName}/{computed-dateRange}/**)" -ForegroundColor Green
+    Write-Host "✓ Pipeline created (delete + copy whole month folder; target = today - catchupDays)" -ForegroundColor Green
 
     # =========================================================================
-    # Step 8: Create and Start Triggers (Daily, Catchup, Monthly)
-    # On-demand "onetime" runs are webhook-only — no scheduled trigger.
+    # Step 8: Create and Start Triggers (Daily + Monthly)
+    #     Daily fires every day; Monthly fires on monthlyDayOfMonth. Both pass
+    #     the same catchupDays so the pipeline computes the same target month.
+    #     On-demand runs (from the customer portal) invoke the same pipeline
+    #     with daily params via the webhook in Step 9.
     # =========================================================================
     Write-Host "`n[8] Creating Triggers" -ForegroundColor Cyan
 
@@ -849,8 +729,18 @@ try {
 
     $startTimeIso = $ScheduleStartTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-    # ---- DailyTrigger: every day at $dailyRunTime $timeZone (current month dailies) ----
-    Write-Host "DailyTrigger — every day $dailyRunTime $timeZone (current month dailies, lookback $dailyLookbackDays d)" -ForegroundColor Yellow
+    # ---- Drop the legacy Catchup trigger if a previous deploy of this site left
+    #      one behind. The catchup window is now folded into Daily via catchupDays. ----
+    $legacyCatchup = Get-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $LegacyCatchupName -ErrorAction SilentlyContinue
+    if ($legacyCatchup) {
+        Write-Host "Removing legacy Catchup trigger '$LegacyCatchupName'..." -ForegroundColor Yellow
+        Stop-AdfTriggerIfRunning -Name $LegacyCatchupName
+        Remove-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $LegacyCatchupName -Force -ErrorAction SilentlyContinue | Out-Null
+        Write-Host "✓ Legacy Catchup trigger removed" -ForegroundColor Green
+    }
+
+    # ---- DailyTrigger: every day at $dailyRunTime $timeZone ----
+    Write-Host "DailyTrigger — every day $dailyRunTime $timeZone (target month = today - $catchupCutoffDay d)" -ForegroundColor Yellow
     $dailyRecurrence = @{
         frequency = "Day"
         interval  = 1
@@ -863,36 +753,13 @@ try {
     }
     $dailyParams = @{
         sourceFolderName = $dailiesFolder
-        monthOffset      = 0
-        lookbackDays     = $dailyLookbackDays
+        catchupDays      = $catchupCutoffDay
         mode             = "daily"
     }
     Set-AdfTrigger -Name $DailyTriggerName -Definition (New-AdfTriggerDefinition -Name $DailyTriggerName -Recurrence $dailyRecurrence -PipelineParameters $dailyParams)
 
-    # ---- CatchupTrigger: days 1..catchupCutoffDay at $catchupRunTime $timeZone (prior month dailies) ----
-    $catchupDays = @(1..$catchupCutoffDay)
-    Write-Host "CatchupTrigger — days 1-$catchupCutoffDay at $catchupRunTime $timeZone (prior month dailies, lookback $catchupLookbackDays d)" -ForegroundColor Yellow
-    $catchupRecurrence = @{
-        frequency = "Month"
-        interval  = 1
-        startTime = $startTimeIso
-        timeZone  = $timeZone
-        schedule  = @{
-            monthDays = $catchupDays
-            hours     = @($catchupTime.Hour)
-            minutes   = @($catchupTime.Minute)
-        }
-    }
-    $catchupParams = @{
-        sourceFolderName = $dailiesFolder
-        monthOffset      = -1
-        lookbackDays     = $catchupLookbackDays
-        mode             = "catchup"
-    }
-    Set-AdfTrigger -Name $CatchupTriggerName -Definition (New-AdfTriggerDefinition -Name $CatchupTriggerName -Recurrence $catchupRecurrence -PipelineParameters $catchupParams)
-
-    # ---- MonthlyTrigger: day $monthlyDayOfMonth at $monthlyRunTime $timeZone (prior month monthlies) ----
-    Write-Host "MonthlyTrigger — day $monthlyDayOfMonth at $monthlyRunTime $timeZone (prior month monthlies, no lookback filter)" -ForegroundColor Yellow
+    # ---- MonthlyTrigger: day $monthlyDayOfMonth at $monthlyRunTime $timeZone ----
+    Write-Host "MonthlyTrigger — day $monthlyDayOfMonth at $monthlyRunTime $timeZone (target month = today - $catchupCutoffDay d)" -ForegroundColor Yellow
     $monthlyRecurrence = @{
         frequency = "Month"
         interval  = 1
@@ -906,24 +773,23 @@ try {
     }
     $monthlyParams = @{
         sourceFolderName = $monthliesFolder
-        monthOffset      = -1
-        lookbackDays     = 0
+        catchupDays      = $catchupCutoffDay
         mode             = "monthly"
     }
     Set-AdfTrigger -Name $MonthlyTriggerName -Definition (New-AdfTriggerDefinition -Name $MonthlyTriggerName -Recurrence $monthlyRecurrence -PipelineParameters $monthlyParams)
 
-    Write-Host "✓ Schedule triggers created. Onetime runs are invoked via webhook only." -ForegroundColor Green
+    Write-Host "✓ Schedule triggers created. On-demand runs invoke the daily pipeline via webhook." -ForegroundColor Green
 
     # =========================================================================
-    # Step 9: Create Service Principal for remote / webhook pipeline triggering
+    # Step 9: Create Service Principal for on-demand pipeline triggering
     #
     # This SP is used ONLY to allow the customer portal to fire on-demand
-    # ("onetime") pipeline runs via the ADF createRun REST endpoint. The three
-    # scheduled triggers (Daily/Catchup/Monthly) work without it. If the
-    # operator does not have Microsoft Entra permissions to create app
-    # registrations, we degrade gracefully: log a warning, skip Step 9, and
-    # flag WebhookStatus='disabled' in the result payload so the customer
-    # portal knows to hide the "Run Now" button.
+    # pipeline runs via the ADF createRun REST endpoint — invoking the daily
+    # pipeline with daily params. The two scheduled triggers (Daily, Monthly)
+    # work without it. If the operator does not have Microsoft Entra permissions
+    # to create app registrations, we degrade gracefully: log a warning, skip
+    # Step 9, and flag WebhookStatus='disabled' in the result payload so the
+    # customer portal knows to hide the "Run Now" button.
     # =========================================================================
     Write-Host "`n[9] Creating webhook Service Principal" -ForegroundColor Cyan
 
@@ -966,7 +832,7 @@ try {
     }
 
     if (-not $canCreateApps) {
-        $webhookDisabledReason = "Operator lacks Microsoft Entra ID permission to create app registrations in tenant '$webhookTenantId'. Tenant-wide 'Users can register applications' is disabled and the caller does not hold Application Developer / Application Administrator / Cloud Application Administrator / Global Administrator. Scheduled triggers (Daily/Catchup/Monthly) will still run normally. On-demand 'onetime' runs from the customer portal will be unavailable until a directory-privileged operator re-runs this deploy, or an SP is provisioned manually."
+        $webhookDisabledReason = "Operator lacks Microsoft Entra ID permission to create app registrations in tenant '$webhookTenantId'. Tenant-wide 'Users can register applications' is disabled and the caller does not hold Application Developer / Application Administrator / Cloud Application Administrator / Global Administrator. Scheduled triggers (Daily, Monthly) will still run normally. On-demand runs from the customer portal will be unavailable until a directory-privileged operator re-runs this deploy, or an SP is provisioned manually."
         Write-Host "⚠ Skipping webhook SP creation — insufficient directory privileges." -ForegroundColor Yellow
         Write-Host "  Reason: $webhookDisabledReason" -ForegroundColor Yellow
         Write-Host "  Scheduled triggers still work; only on-demand runs are disabled." -ForegroundColor Yellow
@@ -1048,15 +914,13 @@ try {
     Write-Host "Source:               $exportStorageAccount/$exportStorageContainer/$normalizedPath" -ForegroundColor White
     Write-Host "  Dailies folder:     $dailiesFolder" -ForegroundColor White
     Write-Host "  Monthlies folder:   $monthliesFolder" -ForegroundColor White
-    Write-Host "  Onetime folder:     $onetimeFolder" -ForegroundColor White
     Write-Host "Destination:          $customerStorageAccount/$destContainerName/$normalizedPath" -ForegroundColor White
-    Write-Host "Pipeline:             $PipelineName" -ForegroundColor White
+    Write-Host "Pipeline:             $PipelineName  (mirror whole month folder; target = today - $catchupCutoffDay d)" -ForegroundColor White
     Write-Host "TimeZone:             $timeZone" -ForegroundColor White
     Write-Host "Triggers:" -ForegroundColor White
-    Write-Host "  $DailyTriggerName    — daily $dailyRunTime (lookback $dailyLookbackDays d)" -ForegroundColor White
-    Write-Host "  $CatchupTriggerName  — days 1-$catchupCutoffDay at $catchupRunTime (lookback $catchupLookbackDays d)" -ForegroundColor White
-    Write-Host "  $MonthlyTriggerName  — day $monthlyDayOfMonth at $monthlyRunTime (no lookback filter)" -ForegroundColor White
-    Write-Host "  (onetime: webhook-only — no scheduled trigger)" -ForegroundColor White
+    Write-Host "  $DailyTriggerName    — every day at $dailyRunTime" -ForegroundColor White
+    Write-Host "  $MonthlyTriggerName  — day $monthlyDayOfMonth at $monthlyRunTime" -ForegroundColor White
+    Write-Host "  (on-demand runs invoke the daily pipeline via webhook)" -ForegroundColor White
     if ($usePrivateEndpoint) {
         Write-Host "Integration Runtime:  $IRName (Managed VNet)" -ForegroundColor White
         Write-Host "Private Endpoint:     $ManagedPEName" -ForegroundColor White
@@ -1069,24 +933,23 @@ try {
         Write-Host "Webhook Trigger URI:  $webhookTriggerUri" -ForegroundColor White
     } else {
         Write-Host "Webhook Disabled:     $webhookDisabledReason" -ForegroundColor Yellow
-        Write-Host "  On-demand 'onetime' runs from the customer portal will be unavailable." -ForegroundColor Yellow
-        Write-Host "  Scheduled runs (Daily/Catchup/Monthly) are unaffected." -ForegroundColor Yellow
+        Write-Host "  On-demand runs from the customer portal will be unavailable." -ForegroundColor Yellow
+        Write-Host "  Scheduled runs (Daily, Monthly) are unaffected." -ForegroundColor Yellow
     }
     Write-Host ("=" * 80) -ForegroundColor Green
 
-    # Webhook usage instructions — onetime / on-demand
+    # Webhook usage instructions — on-demand fires the daily pipeline
     if ($webhookStatus -ne 'ready') {
         Write-Host "`nOn-demand webhook is NOT available for this site (see Webhook Disabled reason above)." -ForegroundColor Yellow
     }
-    Write-Host "`nTo trigger an on-demand 'onetime' run via webhook (PowerShell):" -ForegroundColor Yellow
+    Write-Host "`nTo trigger an on-demand run via webhook (PowerShell):" -ForegroundColor Yellow
     Write-Host @"
 `$tokenBody = `"grant_type=client_credentials&client_id=$webhookClientId&client_secret=<SECRET>&resource=https://management.azure.com/"
 `$tokenResp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$webhookTenantId/oauth2/token" -Method Post -Body `$tokenBody
 `$body = @{
-    sourceFolderName = '$onetimeFolder'
-    monthOffset      = 0       # 0 = current month folder, -1 = prior month
-    lookbackDays     = 0       # 0 = no LastModified filter (grab everything in folder)
-    mode             = 'onetime'
+    sourceFolderName = '$dailiesFolder'
+    catchupDays      = $catchupCutoffDay
+    mode             = 'daily'
 } | ConvertTo-Json
 Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorization = "Bearer `$(`$tokenResp.access_token)"} -ContentType "application/json" -Body `$body
 "@ -ForegroundColor Gray
@@ -1098,7 +961,7 @@ Invoke-AzDataFactoryV2Pipeline ``
     -ResourceGroupName "$ResourceGroupName" ``
     -DataFactoryName "$DataFactoryName" ``
     -PipelineName "$PipelineName" ``
-    -Parameter @{ sourceFolderName = '$onetimeFolder'; monthOffset = 0; lookbackDays = 0; mode = 'onetime' }
+    -Parameter @{ sourceFolderName = '$dailiesFolder'; catchupDays = $catchupCutoffDay; mode = 'daily' }
 "@ -ForegroundColor Gray
 
     # Build results object (Add-Member style per project convention)
@@ -1112,7 +975,6 @@ Invoke-AzDataFactoryV2Pipeline ``
     $results | Add-Member -MemberType NoteProperty -Name SourceFolder        -Value $normalizedPath
     $results | Add-Member -MemberType NoteProperty -Name DailiesFolder       -Value $dailiesFolder
     $results | Add-Member -MemberType NoteProperty -Name MonthliesFolder     -Value $monthliesFolder
-    $results | Add-Member -MemberType NoteProperty -Name OnetimeFolder       -Value $onetimeFolder
     $results | Add-Member -MemberType NoteProperty -Name DestStorage         -Value $customerStorageAccount
     $results | Add-Member -MemberType NoteProperty -Name DestContainer       -Value $destContainerName
     $results | Add-Member -MemberType NoteProperty -Name DestFolder          -Value $normalizedPath
@@ -1120,14 +982,10 @@ Invoke-AzDataFactoryV2Pipeline ``
     $results | Add-Member -MemberType NoteProperty -Name TimeZone            -Value $timeZone
     $results | Add-Member -MemberType NoteProperty -Name DailyTrigger        -Value $DailyTriggerName
     $results | Add-Member -MemberType NoteProperty -Name DailyRunTime        -Value $dailyRunTime
-    $results | Add-Member -MemberType NoteProperty -Name DailyLookbackDays   -Value $dailyLookbackDays
-    $results | Add-Member -MemberType NoteProperty -Name CatchupTrigger      -Value $CatchupTriggerName
-    $results | Add-Member -MemberType NoteProperty -Name CatchupRunTime      -Value $catchupRunTime
-    $results | Add-Member -MemberType NoteProperty -Name CatchupCutoffDay    -Value $catchupCutoffDay
-    $results | Add-Member -MemberType NoteProperty -Name CatchupLookbackDays -Value $catchupLookbackDays
     $results | Add-Member -MemberType NoteProperty -Name MonthlyTrigger      -Value $MonthlyTriggerName
     $results | Add-Member -MemberType NoteProperty -Name MonthlyDayOfMonth   -Value $monthlyDayOfMonth
     $results | Add-Member -MemberType NoteProperty -Name MonthlyRunTime      -Value $monthlyRunTime
+    $results | Add-Member -MemberType NoteProperty -Name CatchupCutoffDay    -Value $catchupCutoffDay
     $results | Add-Member -MemberType NoteProperty -Name IntegrationRuntime  -Value $(if ($usePrivateEndpoint) { $IRName } else { "AutoResolveIntegrationRuntime" })
     $results | Add-Member -MemberType NoteProperty -Name PrivateEndpoint     -Value $(if ($usePrivateEndpoint) { $ManagedPEName } else { $null })
     $results | Add-Member -MemberType NoteProperty -Name ScheduleStartTime   -Value $ScheduleStartTime
