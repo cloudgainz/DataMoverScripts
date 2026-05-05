@@ -477,12 +477,7 @@ try {
         catchupDays  = "@{pipeline().parameters.catchupDays}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "Succeeded"
-        filesRead           = "@{activity('CopyMonthFolder').output.filesRead}"
-        filesWritten        = "@{activity('CopyMonthFolder').output.filesWritten}"
-        dataReadBytes       = "@{activity('CopyMonthFolder').output.dataRead}"
-        dataWrittenBytes    = "@{activity('CopyMonthFolder').output.dataWritten}"
-        copyDurationSeconds = "@{activity('CopyMonthFolder').output.copyDuration}"
-        throughputMBps      = "@{if(greater(int(activity('CopyMonthFolder').output.copyDuration), 0), div(div(int(activity('CopyMonthFolder').output.dataWritten), 1048576), int(activity('CopyMonthFolder').output.copyDuration)), 0)}"
+        guidFoldersCopied = "@{length(activity('FilterSourceGuids').output.Value)}"
     }
 
     $failureBody = @{
@@ -493,8 +488,8 @@ try {
         dateRange    = "@{variables('dateRange')}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "Failed"
-        errorCode    = "@{coalesce(activity('CheckDestExists').error.errorCode, activity('DeleteDestFolderIfExists').error.errorCode, activity('CopyMonthFolder').error.errorCode)}"
-        errorMessage = "@{coalesce(activity('CheckDestExists').error.message, activity('DeleteDestFolderIfExists').error.message, activity('CopyMonthFolder').error.message)}"
+        errorCode    = "@{coalesce(activity('CheckDestExists').error.errorCode, activity('DeleteDestFolderIfExists').error.errorCode, activity('ListSourceGuids').error.errorCode, activity('ForEachSourceGuid').error.errorCode)}"
+        errorMessage = "@{coalesce(activity('CheckDestExists').error.message, activity('DeleteDestFolderIfExists').error.message, activity('ListSourceGuids').error.message, activity('ForEachSourceGuid').error.message)}"
     }
 
     # Body for when the logging activity itself errors (copy succeeded but WriteSuccessLog failed)
@@ -603,50 +598,88 @@ try {
                         )
                     }
                 },
-                # CopyMonthFolder — copy the entire source month folder as-is. Recursive,
-                # no date filter, no per-guid iteration. Single activity, single output.
+                # ListSourceGuids — enumerate immediate children of the SOURCE
+                # {dateRangeFolder}. Cost Management writes each export run into a
+                # fresh guid sub-folder; we pick those up as childItems of type
+                # 'Folder'. HNS placeholder blobs at this level appear as childItems
+                # of type 'File' with the same name as their folder — those get
+                # excluded by FilterSourceGuids below, which is how the original
+                # pipeline avoided mirroring 0-byte marker blobs to dest.
                 @{
-                    name      = "CopyMonthFolder"
-                    type      = "Copy"
+                    name      = "ListSourceGuids"
+                    type      = "GetMetadata"
                     dependsOn = @( @{ activity = "DeleteDestFolderIfExists"; dependencyConditions = @("Succeeded") } )
-                    inputs = @(
-                        @{
+                    typeProperties = @{
+                        dataset = @{
                             referenceName = $SourceDatasetName
                             type          = "DatasetReference"
                             parameters = @{
                                 folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
                             }
                         }
-                    )
-                    outputs = @(
-                        @{
-                            referenceName = $DestDatasetName
-                            type          = "DatasetReference"
-                            parameters = @{
-                                folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
-                            }
-                        }
-                    )
+                        fieldList      = @("childItems")
+                        storeSettings  = @{ type = "AzureBlobStorageReadSettings"; recursive = $false }
+                        formatSettings = @{ type = "BinaryReadSettings" }
+                    }
+                },
+                # FilterSourceGuids — keep only directory entries; drops the same-named
+                # marker blobs that would otherwise get mirrored as 0-byte files.
+                @{
+                    name      = "FilterSourceGuids"
+                    type      = "Filter"
+                    dependsOn = @( @{ activity = "ListSourceGuids"; dependencyConditions = @("Succeeded") } )
                     typeProperties = @{
-                        source = @{
-                            type          = "BinarySource"
-                            storeSettings = @{
-                                # wildcardFolderPath/wildcardFileName: HNS-enabled storage
-                                # creates 0-byte directory-marker blobs at folder boundaries
-                                # (named after the folder, no extension). A naive recursive
-                                # Copy mirrors them. Requiring at least one '.' in the
-                                # filename skips the markers while keeping real data files
-                                # (csv/json/parquet/etc — all have extensions).
-                                type               = "AzureBlobStorageReadSettings"
-                                recursive          = $true
-                                wildcardFolderPath = "*"
-                                wildcardFileName   = "*.*"
+                        items     = @{ value = "@activity('ListSourceGuids').output.childItems"; type = "Expression" }
+                        condition = @{ value = "@equals(item().type, 'Folder')"; type = "Expression" }
+                    }
+                },
+                # ForEachSourceGuid — one Copy per guid sub-folder. Sequential keeps
+                # things simple. Each Copy mirrors the entire guid folder recursively
+                # with NO date filter (every file in the guid folder gets copied).
+                @{
+                    name      = "ForEachSourceGuid"
+                    type      = "ForEach"
+                    dependsOn = @( @{ activity = "FilterSourceGuids"; dependencyConditions = @("Succeeded") } )
+                    typeProperties = @{
+                        items        = @{ value = "@activity('FilterSourceGuids').output.Value"; type = "Expression" }
+                        isSequential = $true
+                        activities   = @(
+                            @{
+                                name = "CopyGuid"
+                                type = "Copy"
+                                inputs  = @(
+                                    @{
+                                        referenceName = $SourceDatasetName
+                                        type          = "DatasetReference"
+                                        parameters = @{
+                                            folderPath = @{ value = "@concat(variables('dateRangeFolder'), '/', item().name)"; type = "Expression" }
+                                        }
+                                    }
+                                )
+                                outputs = @(
+                                    @{
+                                        referenceName = $DestDatasetName
+                                        type          = "DatasetReference"
+                                        parameters = @{
+                                            folderPath = @{ value = "@concat(variables('dateRangeFolder'), '/', item().name)"; type = "Expression" }
+                                        }
+                                    }
+                                )
+                                typeProperties = @{
+                                    source = @{
+                                        type          = "BinarySource"
+                                        storeSettings = @{
+                                            type      = "AzureBlobStorageReadSettings"
+                                            recursive = $true
+                                        }
+                                    }
+                                    sink = @{
+                                        type          = "BinarySink"
+                                        storeSettings = @{ type = "AzureBlobStorageWriteSettings" }
+                                    }
+                                }
                             }
-                        }
-                        sink = @{
-                            type          = "BinarySink"
-                            storeSettings = @{ type = "AzureBlobStorageWriteSettings" }
-                        }
+                        )
                     }
                 },
                 # WriteSuccessLog — PUT a JSON summary blob on success
@@ -654,7 +687,7 @@ try {
                     name      = "WriteSuccessLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "CopyMonthFolder"; dependencyConditions = @("Succeeded") }
+                        @{ activity = "ForEachSourceGuid"; dependencyConditions = @("Succeeded") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
@@ -666,15 +699,14 @@ try {
                         body = $successBody
                     }
                 },
-                # WriteFailureLog: PUT a JSON error summary blob if any upstream activity
-                # in the chain failed. Skipped on CopyMonthFolder means an upstream
-                # (CheckDestExists or the IfCondition) failed and Copy never ran;
-                # Failed means Copy itself failed. Either way, log it.
+                # WriteFailureLog: fires on Failed OR Skipped of ForEachSourceGuid.
+                # Skipped means an upstream activity (CheckDestExists, IfCondition, or
+                # ListSourceGuids/FilterSourceGuids) failed and the ForEach never ran.
                 @{
                     name      = "WriteFailureLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "CopyMonthFolder"; dependencyConditions = @("Failed", "Skipped") }
+                        @{ activity = "ForEachSourceGuid"; dependencyConditions = @("Failed", "Skipped") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
