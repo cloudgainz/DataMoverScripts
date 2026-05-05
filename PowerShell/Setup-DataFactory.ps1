@@ -493,8 +493,8 @@ try {
         dateRange    = "@{variables('dateRange')}"
         triggerTime  = "@{string(pipeline().TriggerTime)}"
         status       = "Failed"
-        errorCode    = "@{coalesce(activity('DeleteDestFolder').error.errorCode, activity('CopyMonthFolder').error.errorCode)}"
-        errorMessage = "@{coalesce(activity('DeleteDestFolder').error.message, activity('CopyMonthFolder').error.message)}"
+        errorCode    = "@{coalesce(activity('CheckDestExists').error.errorCode, activity('DeleteDestFolderIfExists').error.errorCode, activity('CopyMonthFolder').error.errorCode)}"
+        errorMessage = "@{coalesce(activity('CheckDestExists').error.message, activity('DeleteDestFolderIfExists').error.message, activity('CopyMonthFolder').error.message)}"
     }
 
     # Body for when the logging activity itself errors (copy succeeded but WriteSuccessLog failed)
@@ -513,7 +513,7 @@ try {
         name       = $PipelineName
         properties = @{
             parameters = @{
-                sourceFolderName = @{ type = "String" }
+                sourceFolderName = @{ type = "String"; defaultValue = $dailiesFolder }
                 catchupDays      = @{ type = "Int";    defaultValue = $catchupCutoffDay }
                 mode             = @{ type = "String"; defaultValue = "daily" }
             }
@@ -555,12 +555,12 @@ try {
                         }
                     }
                 },
-                # DeleteDestFolder — wipe the destination month folder before the copy so
-                # the dest mirrors the source exactly. Idempotent: if the folder doesn't
-                # exist yet, Delete reports 0 deleted and continues.
+                # CheckDestExists — does the destination month folder exist yet? Returns
+                # exists=false cleanly without erroring (unlike Delete, which fails on a
+                # missing path). Output gates the IfCondition below.
                 @{
-                    name      = "DeleteDestFolder"
-                    type      = "Delete"
+                    name      = "CheckDestExists"
+                    type      = "GetMetadata"
                     dependsOn = @( @{ activity = "SetDateRangeFolder"; dependencyConditions = @("Succeeded") } )
                     typeProperties = @{
                         dataset = @{
@@ -570,8 +570,37 @@ try {
                                 folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
                             }
                         }
-                        enableLogging = $false
-                        storeSettings = @{ type = "AzureBlobStorageReadSettings"; recursive = $true }
+                        fieldList      = @("exists")
+                        storeSettings  = @{ type = "AzureBlobStorageReadSettings"; recursive = $false }
+                        formatSettings = @{ type = "BinaryReadSettings" }
+                    }
+                },
+                # DeleteDestFolderIfExists — wipe the destination month folder when it
+                # exists, so the subsequent Copy mirrors the source exactly. Skipped on
+                # first run for any new month (folder won't exist yet), Copy still runs.
+                @{
+                    name      = "DeleteDestFolderIfExists"
+                    type      = "IfCondition"
+                    dependsOn = @( @{ activity = "CheckDestExists"; dependencyConditions = @("Succeeded") } )
+                    typeProperties = @{
+                        expression = @{ value = "@activity('CheckDestExists').output.exists"; type = "Expression" }
+                        ifTrueActivities = @(
+                            @{
+                                name = "DeleteDestFolder"
+                                type = "Delete"
+                                typeProperties = @{
+                                    dataset = @{
+                                        referenceName = $DestDatasetName
+                                        type          = "DatasetReference"
+                                        parameters = @{
+                                            folderPath = @{ value = "@variables('dateRangeFolder')"; type = "Expression" }
+                                        }
+                                    }
+                                    enableLogging = $false
+                                    storeSettings = @{ type = "AzureBlobStorageReadSettings"; recursive = $true }
+                                }
+                            }
+                        )
                     }
                 },
                 # CopyMonthFolder — copy the entire source month folder as-is. Recursive,
@@ -579,7 +608,7 @@ try {
                 @{
                     name      = "CopyMonthFolder"
                     type      = "Copy"
-                    dependsOn = @( @{ activity = "DeleteDestFolder"; dependencyConditions = @("Succeeded") } )
+                    dependsOn = @( @{ activity = "DeleteDestFolderIfExists"; dependencyConditions = @("Succeeded") } )
                     inputs = @(
                         @{
                             referenceName = $SourceDatasetName
@@ -602,8 +631,16 @@ try {
                         source = @{
                             type          = "BinarySource"
                             storeSettings = @{
-                                type      = "AzureBlobStorageReadSettings"
-                                recursive = $true
+                                # wildcardFolderPath/wildcardFileName: HNS-enabled storage
+                                # creates 0-byte directory-marker blobs at folder boundaries
+                                # (named after the folder, no extension). A naive recursive
+                                # Copy mirrors them. Requiring at least one '.' in the
+                                # filename skips the markers while keeping real data files
+                                # (csv/json/parquet/etc — all have extensions).
+                                type               = "AzureBlobStorageReadSettings"
+                                recursive          = $true
+                                wildcardFolderPath = "*"
+                                wildcardFileName   = "*.*"
                             }
                         }
                         sink = @{
@@ -629,13 +666,15 @@ try {
                         body = $successBody
                     }
                 },
-                # WriteFailureLog: PUT a JSON error summary blob if Delete OR Copy failed
+                # WriteFailureLog: PUT a JSON error summary blob if any upstream activity
+                # in the chain failed. Skipped on CopyMonthFolder means an upstream
+                # (CheckDestExists or the IfCondition) failed and Copy never ran;
+                # Failed means Copy itself failed. Either way, log it.
                 @{
                     name      = "WriteFailureLog"
                     type      = "WebActivity"
                     dependsOn = @(
-                        @{ activity = "DeleteDestFolder"; dependencyConditions = @("Failed") },
-                        @{ activity = "CopyMonthFolder";  dependencyConditions = @("Failed") }
+                        @{ activity = "CopyMonthFolder"; dependencyConditions = @("Failed", "Skipped") }
                     )
                     typeProperties = @{
                         url    = @{ value = $logBlobUrlExpr; type = "Expression" }
@@ -943,15 +982,11 @@ try {
         Write-Host "`nOn-demand webhook is NOT available for this site (see Webhook Disabled reason above)." -ForegroundColor Yellow
     }
     Write-Host "`nTo trigger an on-demand run via webhook (PowerShell):" -ForegroundColor Yellow
+    Write-Host "  Pipeline parameters all have defaults; webhook fires the daily mirror with no body." -ForegroundColor Gray
     Write-Host @"
 `$tokenBody = `"grant_type=client_credentials&client_id=$webhookClientId&client_secret=<SECRET>&resource=https://management.azure.com/"
 `$tokenResp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$webhookTenantId/oauth2/token" -Method Post -Body `$tokenBody
-`$body = @{
-    sourceFolderName = '$dailiesFolder'
-    catchupDays      = $catchupCutoffDay
-    mode             = 'daily'
-} | ConvertTo-Json
-Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorization = "Bearer `$(`$tokenResp.access_token)"} -ContentType "application/json" -Body `$body
+Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorization = "Bearer `$(`$tokenResp.access_token)"} -ContentType "application/json" -Body '{}'
 "@ -ForegroundColor Gray
 
     # Manual trigger instructions
@@ -960,8 +995,7 @@ Invoke-RestMethod -Uri "$webhookTriggerUri" -Method Post -Headers @{Authorizatio
 Invoke-AzDataFactoryV2Pipeline ``
     -ResourceGroupName "$ResourceGroupName" ``
     -DataFactoryName "$DataFactoryName" ``
-    -PipelineName "$PipelineName" ``
-    -Parameter @{ sourceFolderName = '$dailiesFolder'; catchupDays = $catchupCutoffDay; mode = 'daily' }
+    -PipelineName "$PipelineName"
 "@ -ForegroundColor Gray
 
     # Build results object (Add-Member style per project convention)
